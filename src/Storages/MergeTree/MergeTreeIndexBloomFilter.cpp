@@ -387,8 +387,15 @@ bool MergeTreeIndexConditionBloomFilter::traverseFunction(const RPNBuilderTreeNo
             if (traverseTreeEquals(function_name, lhs_argument, const_type, const_value, out, parent))
                 return true;
         }
-        else if (lhs_argument.tryGetConstant(const_value, const_type) && (function_name == "equals" || function_name == "notEquals"))
+        // Support `has(const_array, column)` by allowing the `has` function when its
+        // left-hand side is a constant. This is the "gatekeeper" that allows this
+        // pattern to be passed to `traverseTreeEquals` for optimization.
+        else if (lhs_argument.tryGetConstant(const_value, const_type)
+            && (function_name == "equals" || function_name == "notEquals" || function_name == "has"))
         {
+            // Because the condition is now true, we call traverseTreeEquals.
+            // Crucially, it passes the column (rhs_argument) as the `key_node`
+            // and the constant array (const_value) as the `value_field`.
             if (traverseTreeEquals(function_name, rhs_argument, const_type, const_value, out, parent))
                 return true;
         }
@@ -626,21 +633,67 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
 
         if (function_name == "has" || function_name == "indexOf")
         {
-            if (!array_type)
-                return false;
-
-            /// We can treat `indexOf` function similar to `has`.
-            /// But it is little more cumbersome, compare: `has(arr, elem)` and `indexOf(arr, elem) != 0`.
-            /// The `parent` in this context is expected to be function `!=` (`notEquals`).
-            if (function_name == "has" || indexOfCanUseBloomFilter(parent))
+            /// If `array_type` is not null, it means the indexed column `key_column_name` is an Array.
+            /// This is the original logic for `has(array_column, constant)`.
+            if (array_type)
             {
-                out.function = RPNElement::FUNCTION_HAS;
-                const DataTypePtr actual_type = BloomFilter::getPrimitiveType(array_type->getNestedType());
-                auto converted_field = convertFieldToType(value_field, *actual_type, value_type.get());
-                if (converted_field.isNull())
+                /// We can treat `indexOf` function similar to `has`.
+                /// But it is little more cumbersome, compare: `has(arr, elem)` and `indexOf(arr, elem) != 0`.
+                /// The `parent` in this context is expected to be function `!=` (`notEquals`).
+                if (function_name == "has" || indexOfCanUseBloomFilter(parent))
+                {
+                    out.function = RPNElement::FUNCTION_HAS;
+                    const DataTypePtr actual_type = BloomFilter::getPrimitiveType(array_type->getNestedType());
+                    auto converted_field = convertFieldToType(value_field, *actual_type, value_type.get());
+                    if (converted_field.isNull())
+                        return false;
+
+                    out.predicate.emplace_back(std::make_pair(position, BloomFilterHash::hashWithField(actual_type.get(), converted_field)));
+                }
+            }
+            /// If `array_type` is null, it means the indexed column is a primitive type.
+            /// This is the new logic to handle `has(constant_array, column)`.
+            else
+            {
+                /// This optimization is not applicable for `indexOf(const, col)`.
+                if (function_name == "indexOf")
                     return false;
 
-                out.predicate.emplace_back(std::make_pair(position, BloomFilterHash::hashWithField(actual_type.get(), converted_field)));
+                /// Sanity check: the constant value must be an array.
+                if (value_field.getType() != Field::Types::Array)
+                    return false;
+
+                /// Get the underlying data type of the indexed column (e.g., UInt64).
+                const DataTypePtr actual_type = BloomFilter::getPrimitiveType(index_type);
+                ColumnPtr column;
+                {
+                    /// Create a temporary in-memory column to hold the values from the constant array.
+                    const bool is_nullable = actual_type->isNullable();
+                    auto mutable_column = actual_type->createColumn();
+
+                    /// Iterate through each element in the constant array from the query (e.g., `1`, then `2`, then `3`).
+                    for (const auto & f : value_field.safeGet<Array>())
+                    {
+                        if ((f.isNull() && !is_nullable) || f.isDecimal(f.getType())) /// NOLINT(readability-static-accessed-through-instance)
+                            return false;
+
+                        /// Convert each element to the column's data type and insert it.
+                        auto converted = convertFieldToType(f, *actual_type);
+                        if (converted.isNull())
+                            return false;
+
+                        mutable_column->insert(converted);
+                    }
+
+                    column = std::move(mutable_column);
+                }
+
+                /// Key step: We reuse the `HAS_ANY` logic. This checks if the bloom filter
+                /// might contain ANY of the values from the constant array.
+                out.function = RPNElement::FUNCTION_HAS_ANY;
+                /// Create the predicate by hashing the contents of our temporary column.
+                /// This hash is what will be checked against the bloom filter for the indexed column.
+                out.predicate.emplace_back(std::make_pair(position, BloomFilterHash::hashWithColumn(actual_type, column, 0, column->size())));
             }
         }
         else if (function_name == "hasAny" || function_name == "hasAll")
