@@ -537,6 +537,30 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeIn(
 }
 
 
+static ColumnPtr createColumnFromConstantArray(const Field & value_field, const DataTypePtr & actual_type)
+{
+    if (value_field.getType() != Field::Types::Array)
+        return nullptr;
+
+    const bool is_nullable = actual_type->isNullable();
+    auto mutable_column = actual_type->createColumn();
+
+    for (const auto & f : value_field.safeGet<Array>())
+    {
+        if ((f.isNull() && !is_nullable) || f.isDecimal(f.getType())) /// NOLINT(readability-static-accessed-through-instance)
+            return nullptr;
+
+        auto converted = convertFieldToType(f, *actual_type);
+        if (converted.isNull())
+            return nullptr;
+
+        mutable_column->insert(converted);
+    }
+
+    return std::move(mutable_column);
+}
+
+
 static bool indexOfCanUseBloomFilter(const RPNBuilderTreeNode * parent)
 {
     if (!parent)
@@ -659,34 +683,11 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
                 if (function_name == "indexOf")
                     return false;
 
-                /// Sanity check: the constant value must be an array.
-                if (value_field.getType() != Field::Types::Array)
-                    return false;
-
-                /// Get the underlying data type of the indexed column (e.g., UInt64).
                 const DataTypePtr actual_type = BloomFilter::getPrimitiveType(index_type);
-                ColumnPtr column;
-                {
-                    /// Create a temporary in-memory column to hold the values from the constant array.
-                    const bool is_nullable = actual_type->isNullable();
-                    auto mutable_column = actual_type->createColumn();
+                ColumnPtr column = createColumnFromConstantArray(value_field, actual_type);
 
-                    /// Iterate through each element in the constant array from the query (e.g., `1`, then `2`, then `3`).
-                    for (const auto & f : value_field.safeGet<Array>())
-                    {
-                        if ((f.isNull() && !is_nullable) || f.isDecimal(f.getType())) /// NOLINT(readability-static-accessed-through-instance)
-                            return false;
-
-                        /// Convert each element to the column's data type and insert it.
-                        auto converted = convertFieldToType(f, *actual_type);
-                        if (converted.isNull())
-                            return false;
-
-                        mutable_column->insert(converted);
-                    }
-
-                    column = std::move(mutable_column);
-                }
+                if (!column)
+                    return false;
 
                 /// Key step: We reuse the `HAS_ANY` logic. This checks if the bloom filter
                 /// might contain ANY of the values from the constant array.
@@ -701,29 +702,11 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
             if (!array_type)
                 return false;
 
-            if (value_field.getType() != Field::Types::Array)
-                return false;
-
             const DataTypePtr actual_type = BloomFilter::getPrimitiveType(array_type->getNestedType());
-            ColumnPtr column;
-            {
-                const bool is_nullable = actual_type->isNullable();
-                auto mutable_column = actual_type->createColumn();
+            ColumnPtr column = createColumnFromConstantArray(value_field, actual_type);
 
-                for (const auto & f : value_field.safeGet<Array>())
-                {
-                    if ((f.isNull() && !is_nullable) || f.isDecimal(f.getType())) /// NOLINT(readability-static-accessed-through-instance)
-                        return false;
-
-                    auto converted = convertFieldToType(f, *actual_type);
-                    if (converted.isNull())
-                        return false;
-
-                    mutable_column->insert(converted);
-                }
-
-                column = std::move(mutable_column);
-            }
+            if (!column)
+                return false;
 
             out.function = function_name == "hasAny" ?
                 RPNElement::FUNCTION_HAS_ANY :
