@@ -1266,16 +1266,7 @@ bool KeyCondition::tryPrepareSetIndex(
     bool & allow_constant_transformation,
     bool & is_constant_transformed)
 {
-    const auto & function_name = func.getFunctionName();
     const auto & left_arg = func.getArgumentAt(0);
-    const auto & right_arg = func.getArgumentAt(1);
-
-    const RPNBuilderTreeNode * key_node;
-
-    if (function_name == "has")
-        key_node = &right_arg;
-    else
-        key_node = &left_arg;
 
     out_key_column_num = 0;
     std::vector<MergeTreeSetIndex::KeyTuplePositionMapping> indexes_mapping;
@@ -1311,71 +1302,37 @@ bool KeyCondition::tryPrepareSetIndex(
     };
 
     size_t left_args_count = 1;
-    if (key_node->isFunction())
+    if (left_arg.isFunction())
     {
         /// Note: in case of ActionsDAG, tuple may be a constant.
         /// In this case, there is no keys in tuple. So, we don't have to check it.
-        auto key_node_tuple = key_node->toFunctionNode();
-        if (key_node_tuple.getFunctionName() == "tuple" && key_node_tuple.getArgumentsSize() > 1)
+        auto left_arg_tuple = left_arg.toFunctionNode();
+        if (left_arg_tuple.getFunctionName() == "tuple" && left_arg_tuple.getArgumentsSize() > 1)
         {
-            left_args_count = key_node_tuple.getArgumentsSize();
+            left_args_count = left_arg_tuple.getArgumentsSize();
             for (size_t i = 0; i < left_args_count; ++i)
-                get_key_tuple_position_mapping(key_node_tuple.getArgumentAt(i), i);
+                get_key_tuple_position_mapping(left_arg_tuple.getArgumentAt(i), i);
         }
         else
         {
-            get_key_tuple_position_mapping(*key_node, 0);
+            get_key_tuple_position_mapping(left_arg, 0);
         }
     }
     else
     {
-        get_key_tuple_position_mapping(*key_node, 0);
+        get_key_tuple_position_mapping(left_arg, 0);
     }
 
     if (indexes_mapping.empty())
         return false;
 
-    std::shared_ptr<const Set> prepared_set;
+    const auto right_arg = func.getArgumentAt(1);
 
-    if (function_name == "has")
-    {
-        Field const_array_field;
-        DataTypePtr const_array_type;
-        if (!left_arg.tryGetConstant(const_array_field, const_array_type))
-            return false;
+    auto future_set = right_arg.tryGetPreparedSet();
+    if (!future_set)
+        return false;
 
-        if (const_array_field.getType() != Field::Types::Array)
-            return false;
-
-        auto ast = std::make_shared<ASTLiteral>(const_array_field);
-        auto & tree_context = right_arg.getTreeContext();
-
-        const auto * array_type = typeid_cast<const DataTypeArray *>(const_array_type.get());
-        if (!array_type)
-            return false;
-
-        const auto & array = const_array_field.safeGet<Array>();
-        const auto & nested_type = array_type->getNestedType();
-        auto column = nested_type->createColumn();
-        for (const auto & field : array)
-            column->insert(field);
-
-        Block block_with_data;
-        block_with_data.insert({std::move(column), nested_type, "dummy"});
-
-        ColumnsWithTypeAndName columns = block_with_data.getColumnsWithTypeAndName();
-        auto future_set = std::shared_ptr<FutureSet>(new FutureSetFromTuple(ast->getTreeHash(true), ast, std::move(columns), false, SizeLimits()));
-        prepared_set = future_set->buildOrderedSetInplace(tree_context.getQueryContext());
-    }
-    else
-    {
-        auto future_set = right_arg.tryGetPreparedSet();
-        if (!future_set)
-            return false;
-
-        prepared_set = future_set->buildOrderedSetInplace(right_arg.getTreeContext().getQueryContext());
-    }
-
+    auto prepared_set = future_set->buildOrderedSetInplace(right_arg.getTreeContext().getQueryContext());
     if (!prepared_set)
         return false;
 
@@ -1389,7 +1346,7 @@ bool KeyCondition::tryPrepareSetIndex(
       * we need to convert set column to primary key column.
       */
     auto set_columns = prepared_set->getSetElements();
-    auto set_types = prepared_set->getElementsTypes();
+    auto set_types = future_set->getTypes();
     {
         Columns new_columns;
         DataTypes new_types;
@@ -2037,54 +1994,6 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, RPNEleme
         /// we don't analyze this node further as its condition will always be false.
         out.function = RPNElement::ALWAYS_FALSE;
         return true;
-    }
-
-    if (node.isFunction())
-    {
-        const auto function_node = node.toFunctionNode();
-        if (function_node.getFunctionName() == "has" && function_node.getArgumentsSize() == 2)
-        {
-            const auto & lhs_arg = function_node.getArgumentAt(0);
-            const auto & rhs_arg = function_node.getArgumentAt(1);
-
-            Field const_array_field;
-            DataTypePtr const_array_type;
-            if (lhs_arg.tryGetConstant(const_array_field, const_array_type))
-            {
-                if (const_array_field.getType() == Field::Types::Array)
-                {
-                    size_t key_column_num;
-                    std::optional<size_t> key_space_filling_curve_argument_pos;
-                    DataTypePtr key_res_column_type;
-                    MonotonicFunctionsChain functions_chain;
-
-                    if (isKeyPossiblyWrappedByMonotonicFunctions(rhs_arg, key_column_num, key_space_filling_curve_argument_pos, key_res_column_type, functions_chain, true)
-                        && !key_space_filling_curve_argument_pos)
-                    {
-                        const auto * array_type = typeid_cast<const DataTypeArray *>(const_array_type.get());
-                        if (!array_type)
-                            return false;
-
-                        const auto & array = const_array_field.safeGet<Array>();
-                        const auto & nested_type = array_type->getNestedType();
-                        auto column = nested_type->createColumn();
-                        for (const auto & field : array)
-                            column->insert(field);
-
-                        std::vector<MergeTreeSetIndex::KeyTuplePositionMapping> indexes_mapping;
-                        MergeTreeSetIndex::KeyTuplePositionMapping index_mapping;
-                        index_mapping.tuple_index = 0;
-                        index_mapping.key_index = key_column_num;
-                        index_mapping.functions = functions_chain;
-                        indexes_mapping.push_back(index_mapping);
-
-                        out.set_index = std::make_shared<MergeTreeSetIndex>(Columns{std::move(column)}, std::move(indexes_mapping));
-                        out.function = RPNElement::FUNCTION_IN_SET;
-                        return true;
-                    }
-                }
-            }
-        }
     }
 
     /** Functions < > = != <= >= in `notIn` isNull isNotNull, where one argument is a constant, and the other is one of columns of key,
