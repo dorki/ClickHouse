@@ -1,0 +1,9 @@
+Expression (has(['b', 'd', 'f'], pk))
+  Primary Key:
+    Condition: pk IN ('b', 'd', 'f')
+    Parts: 1/1
+    Granules: 3/6
+
+b
+d
+f
