@@ -468,6 +468,7 @@
             width: 100%;
             border-spacing: 0;
             background-color: var(--element-background-color);
+            table-layout: fixed;
         }
 
         /* Will be displayed when user specified custom format. */
@@ -533,6 +534,20 @@
             display: inline-block;
         }
 
+        .resizer {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 5px;
+            cursor: col-resize;
+            user-select: none;
+            height: 100%;
+        }
+
+        .resizer:hover {
+            background-color: var(--border-color-selected);
+        }
+
         /* The row under mouse pointer is highlight for better legibility. */
         tr:hover
         {
@@ -574,7 +589,6 @@
 
         .row-number
         {
-            width: 1%;
             text-align: right;
             background-color: var(--table-header-color);
             color: var(--misc-text-color);
@@ -711,6 +725,7 @@
         .u-cursor-pt {position: absolute;top: 0;left: 0;border-radius: 50%;border: 0 solid;pointer-events: none;will-change: transform;z-index: 100;/*this has to be !important since we set inline "background" shorthand */background-clip: padding-box !important;}
         .u-axis.u-off, .u-select.u-off, .u-cursor-x.u-off, .u-cursor-y.u-off, .u-cursor-pt.u-off {display: none;}
     </style>
+    <style id="dynamic-styles"></style>
 </head>
 
 <body>
@@ -1190,23 +1205,14 @@ async function postImpl(posted_request_num, query)
         return;
     }
 
-    if (is_explain_graph) {
-        await renderGraph();
-    } else {
-        if (extremes['min'] && extremes['max']) renderExtremes();
-        if (is_table) transposeTableIfNeeded();
-    }
+    finalizeRendering(query, is_table, is_explain_graph, extremes);
 
-    document.getElementById('check-mark').style.display = 'inline-block';
-    document.getElementById('hourglass').style.display = 'none';
 
     if (is_raw) {
         elapsed_ns = 1e6 * (performance.now() - last_query_start);
     }
 
     updateProgressText();
-    document.documentElement.style.setProperty('--progress', '0');
-    document.documentElement.style.setProperty('--background-color-rotate', queryToColor(query));
 
     if (posted_request_num != request_num) { return; }
 
@@ -1295,21 +1301,11 @@ async function restoreFromHistory(state) {
         updateRaw(state.data);
     }
 
-    if (is_explain_graph) {
-        await renderGraph();
-    } else {
-        if (extremes['min'] && extremes['max']) renderExtremes();
-        if (is_table) transposeTableIfNeeded();
-    }
-
-    document.getElementById('check-mark').style.display = 'inline-block';
-    document.getElementById('hourglass').style.display = 'none';
-
+    finalizeRendering(query, is_table, is_explain_graph, extremes);
+    
     if (is_raw) elapsed_ns = state.elapsed_ns;
 
     updateProgressText();
-    document.documentElement.style.setProperty('--progress', '0');
-    document.documentElement.style.setProperty('--background-color-rotate', queryToColor(query));
 }
 
 let query_area = document.getElementById('query');
@@ -1598,6 +1594,25 @@ function transposeTableIfNeeded()
     table.appendChild(new_tbody);
 }
 
+async function finalizeRendering(query, is_table, is_explain_graph, extremes) {
+    if (is_explain_graph) {
+        await renderGraph();
+    } else {
+        if (extremes['min'] && extremes['max']) renderExtremes();
+        if (is_table) transposeTableIfNeeded();
+        if (row_idx > 0) {
+            const width = (Math.floor(Math.log10(row_idx)) + 1) + 'ch';
+            document.getElementById('dynamic-styles').innerHTML = `.row-number { width: calc(${width} + 2ch) }`;
+        }
+    }
+
+    document.getElementById('check-mark').style.display = 'inline-block';
+    document.getElementById('hourglass').style.display = 'none';
+
+    document.documentElement.style.setProperty('--progress', '0');
+    document.documentElement.style.setProperty('--background-color-rotate', queryToColor(query));
+}
+
 function update(json, fragment) {
     if (json.progress) {
         updateProgress(json.progress);
@@ -1718,6 +1733,32 @@ function appendHeader(meta) {
     table.appendChild(thead);
     table.appendChild(tbody);
     table.style.display = 'table';
+
+    const headers = Array.from(table.querySelectorAll('th')).slice(1);
+    headers.forEach(header => {
+        const resizer = document.createElement('div');
+        resizer.className = 'resizer';
+        header.appendChild(resizer);
+        resizer.addEventListener('mousedown', (e) => {
+            let x = 0;
+            let w = 0;
+
+            const mouseMoveHandler = (e) => {
+                const dx = e.clientX - x;
+                header.style.width = `${w + dx}px`;
+            };
+
+            const mouseUpHandler = () => {
+                document.removeEventListener('mousemove', mouseMoveHandler);
+                document.removeEventListener('mouseup', mouseUpHandler);
+            };
+
+            x = e.clientX;
+            w = header.offsetWidth;
+            document.addEventListener('mousemove', mouseMoveHandler);
+            document.addEventListener('mouseup', mouseUpHandler);
+        });
+    });
 
     row_idx = 0;
 }
