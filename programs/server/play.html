@@ -354,8 +354,8 @@
             display: grid;
             place-items: center;
             gap: 1rem;
-            grid-template-columns: auto auto auto 1fr auto auto;
-            grid-template-areas: "run hint hourglass progress-bar progress-text theme";
+            grid-template-columns: auto auto auto auto 1fr auto auto;
+            grid-template-areas: "toggle-query run hint hourglass progress-bar progress-text theme";
         }
 
         #run
@@ -371,6 +371,24 @@
         }
 
         #run:hover, #run:focus
+        {
+            color: var(--button-active-text-color);
+            background-color: var(--button-active-color);
+        }
+
+        #toggle-query
+        {
+            grid-area: toggle-query;
+            user-select: none;
+            color: var(--button-text-color);
+            background-color: var(--button-color);
+            padding: 0.25rem 1rem;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 100%;
+        }
+
+        #toggle-query:hover
         {
             color: var(--button-active-text-color);
             background-color: var(--button-active-color);
@@ -716,6 +734,7 @@
             </div>
             <div id="query_div"><textarea autofocus spellcheck="false" autocorrect="false" autocomplete="false" data-gramm="false" class="monospace shadow" id="query"></textarea></div>
             <div id="run_div">
+                <button class="shadow" id="toggle-query">Hide Query</button>
                 <button class="shadow" id="run">Run</button>
                 <div id="hint">&nbsp;(Ctrl/Cmd+Enter)</div>
                 <div id="hourglass">⧗</div>
@@ -1318,6 +1337,20 @@ async function post()
     run.innerText = 'Run';
     in_flight = false;
 }
+
+document.getElementById('toggle-query').addEventListener('click', () => {
+    const queryDiv = document.getElementById('query_div');
+    const toggleButton = document.getElementById('toggle-query');
+
+    if (queryDiv.style.display === 'none') {
+        queryDiv.style.display = 'block';
+        toggleButton.textContent = 'Hide Query';
+    } else {
+        queryDiv.style.display = 'none';
+        toggleButton.textContent = 'Show Query';
+    }
+});
+
 
 async function cancel()
 {
