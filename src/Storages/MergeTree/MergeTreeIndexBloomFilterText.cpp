@@ -538,6 +538,27 @@ bool MergeTreeConditionBloomFilterText::traverseTreeEquals(
 
     if (function_name == "has")
     {
+        if (value_data_type.isArray())
+        {
+            out.key_column = *key_index;
+            out.function = RPNElement::FUNCTION_HAS_ANY;
+
+            std::vector<std::vector<BloomFilter>> bloom_filters;
+            bloom_filters.emplace_back();
+
+            for (const auto & element : const_value.safeGet<Array>())
+            {
+                if (element.getType() != Field::Types::String)
+                    return false;
+
+                bloom_filters.back().emplace_back(params);
+                const auto & value = element.safeGet<String>();
+                token_extractor->stringToBloomFilter(value.data(), value.size(), bloom_filters.back().back());
+            }
+            out.set_bloom_filters = std::move(bloom_filters);
+            return true;
+        }
+
         out.key_column = *key_index;
         out.function = RPNElement::FUNCTION_HAS;
         out.bloom_filter = std::make_unique<BloomFilter>(params);
