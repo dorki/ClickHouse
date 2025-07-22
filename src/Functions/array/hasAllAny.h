@@ -90,7 +90,14 @@ public:
 
         auto result_column = ColumnUInt8::create(input_rows_count);
         auto * result_column_ptr = typeid_cast<ColumnUInt8 *>(result_column.get());
-        GatherUtils::sliceHas(*sources[0], *sources[1], search_type, *result_column_ptr);
+
+        bool first_is_const = arguments[0].column->isConstant();
+        bool second_is_const = arguments[1].column->isConstant();
+
+        if (first_is_const && !second_is_const)
+            GatherUtils::sliceHas(*sources[1], *sources[0], search_type, *result_column_ptr);
+        else
+            GatherUtils::sliceHas(*sources[0], *sources[1], search_type, *result_column_ptr);
 
         return result_column;
     }
