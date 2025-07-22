@@ -387,7 +387,8 @@ bool MergeTreeIndexConditionBloomFilter::traverseFunction(const RPNBuilderTreeNo
             if (traverseTreeEquals(function_name, lhs_argument, const_type, const_value, out, parent))
                 return true;
         }
-        else if (lhs_argument.tryGetConstant(const_value, const_type) && (function_name == "has" || function_name == "equals" || function_name == "notEquals"))
+        else if (lhs_argument.tryGetConstant(const_value, const_type)
+            && (function_name == "has" || function_name == "equals" || function_name == "notEquals" || function_name == "hasAny" || function_name == "hasAll"))
         {
             if (traverseTreeEquals(function_name, rhs_argument, const_type, const_value, out, parent))
                 return true;
