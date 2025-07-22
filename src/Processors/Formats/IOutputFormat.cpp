@@ -196,7 +196,7 @@ void IOutputFormat::onProgress(const Progress & progress)
 {
     statistics.progress.incrementPiecewiseAtomically(progress);
     UInt64 elapsed_ns = statistics.watch.elapsedNanoseconds();
-    statistics.progress.elapsed_ns = elapsed_ns;
+    
     if (writesProgressConcurrently())
     {
         has_progress_update_to_write = true;

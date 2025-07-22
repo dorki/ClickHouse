@@ -391,7 +391,7 @@ bool MergeTreeConditionBloomFilterText::extractAtomFromTree(const RPNBuilderTree
                 if (traverseTreeEquals(function_name, left_argument, const_type, const_value, out))
                     return true;
             }
-            else if (left_argument.tryGetConstant(const_value, const_type) && (function_name == "equals" || function_name == "notEquals" || function_name == "hasAny" || function_name == "hasAll"))
+            else if (left_argument.tryGetConstant(const_value, const_type) && (function_name == "equals" || function_name == "notEquals" || function_name == "has" || function_name == "hasAny" || function_name == "hasAll"))
             {
                 if (traverseTreeEquals(function_name, right_argument, const_type, const_value, out))
                     return true;
