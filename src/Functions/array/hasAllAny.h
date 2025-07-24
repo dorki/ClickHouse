@@ -91,8 +91,8 @@ public:
         auto result_column = ColumnUInt8::create(input_rows_count);
         auto * result_column_ptr = typeid_cast<ColumnUInt8 *>(result_column.get());
 
-        bool first_is_const = arguments[0].column->isConstant();
-        bool second_is_const = arguments[1].column->isConstant();
+        bool first_is_const = arguments[0].column->isConst();
+        bool second_is_const = arguments[1].column->isConst();
 
         if (first_is_const && !second_is_const)
             GatherUtils::sliceHas(*sources[1], *sources[0], search_type, *result_column_ptr);

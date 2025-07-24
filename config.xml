@@ -1,0 +1,42 @@
+<yandex>
+    <!-- Network interfaces -->
+    <listen_host>::</listen_host>
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+
+    <!-- Default profile -->
+    <profiles>
+        <default>
+            <max_memory_usage>1000000000</max_memory_usage>
+            <load_balancing>random</load_balancing>
+        </default>
+    </profiles>
+
+    <!-- User configuration -->
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+        </default>
+    </users>
+
+    <!-- Clusters for parallel replicas -->
+    <remote_servers>
+        <parallel_replicas_cluster>
+            <shard>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </parallel_replicas_cluster>
+    </remote_servers>
+</yandex>
+
