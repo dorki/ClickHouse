@@ -44,6 +44,7 @@
 #include <Interpreters/replaceAliasColumnsInQuery.h>
 #include <Interpreters/RewriteCountDistinctVisitor.h>
 #include <Interpreters/RewriteUniqToCountVisitor.h>
+#include <Interpreters/RewriteHasConstArrayVisitor.h>
 #include <Interpreters/getCustomKeyFilterForParallelReplicas.h>
 #include <Interpreters/Context.h>
 
@@ -559,6 +560,12 @@ InterpreterSelectQuery::InterpreterSelectQuery(
     {
         RewriteUniqToCountMatcher::Data data_rewrite_uniq_count;
         RewriteUniqToCountVisitor(data_rewrite_uniq_count).visit(query_ptr);
+    }
+
+    if (1)
+    {
+        RewriteHasConstArrayMatcher::Data data_rewrite_has_const_array;
+        RewriteHasConstArrayVisitor(data_rewrite_has_const_array).visit(query_ptr);
     }
 
     JoinedTables joined_tables(getSubqueryContext(context), getSelectQuery(), options.with_all_cols, options_.is_create_parameterized_view);
