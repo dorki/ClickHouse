@@ -272,10 +272,23 @@ void TableJoin::addDisjunct()
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "StorageJoin with ORs is not supported");
 }
 
-void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool null_safe_comparison)
+void TableJoin::addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, bool null_safe_comparison)
 {
-    addKey(left_table_ast->getColumnName(), right_table_ast->getAliasOrColumnName(), left_table_ast, right_table_ast, null_safe_comparison);
-    right_key_aliases[right_table_ast->getColumnName()] = right_table_ast->getAliasOrColumnName();
+    if (left_ast->as<ASTFunction>() && left_ast->as<ASTFunction>()->name == "has")
+    {
+        const auto & has_func = left_ast->as<ASTFunction &>();
+        addKey(has_func.arguments->children[1]->getColumnName(), right_ast->getAliasOrColumnName(), has_func.arguments->children[1], right_ast, null_safe_comparison);
+    }
+    else if (right_ast->as<ASTFunction>() && right_ast->as<ASTFunction>()->name == "has")
+    {
+        const auto & has_func = right_ast->as<ASTFunction &>();
+        addKey(left_ast->getColumnName(), has_func.arguments->children[1]->getAliasOrColumnName(), left_ast, has_func.arguments->children[1], null_safe_comparison);
+    }
+    else
+    {
+        addKey(left_ast->getColumnName(), right_ast->getAliasOrColumnName(), left_ast, right_ast, null_safe_comparison);
+        right_key_aliases[right_ast->getColumnName()] = right_ast->getAliasOrColumnName();
+    }
 }
 
 /// @return how many times right key appears in ON section.
@@ -815,15 +828,23 @@ void TableJoin::inferJoinKeyCommonType(const LeftNamesAndTypes & left, const Rig
         const auto & ltype = ltypeit->second;
         const auto & rtype = rtypeit->second;
 
-        bool type_equals = require_strict_keys_match ? ltype->equals(*rtype) : JoinCommon::typesEqualUpToNullability(ltype, rtype);
-        if (type_equals)
-            return true;
-
         DataTypePtr common_type;
         try
         {
-            /// TODO(vdimir): use getMostSubtype if possible
-            common_type = DB::getLeastSupertype(DataTypes{ltype, rtype});
+            if (ltype->getTypeId() == TypeIndex::Array)
+            {
+                const auto & ltype_array = static_cast<const DataTypeArray &>(*ltype);
+                common_type = DB::getLeastSupertype(DataTypes{ltype_array.getNestedType(), rtype});
+            }
+            else if (rtype->getTypeId() == TypeIndex::Array)
+            {
+                const auto & rtype_array = static_cast<const DataTypeArray &>(*rtype);
+                common_type = DB::getLeastSupertype(DataTypes{ltype, rtype_array.getNestedType()});
+            }
+            else
+            {
+                common_type = DB::getLeastSupertype(DataTypes{ltype, rtype});
+            }
         }
         catch (DB::Exception & ex)
         {

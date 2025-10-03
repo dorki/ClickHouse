@@ -58,10 +58,65 @@ template <typename Value, typename Mapped> struct KeyGetterForTypeImpl<HashJoin:
 {
     using Type = ColumnsHashing::HashMethodKeysFixed<Value, UInt256, Mapped, false, false, false, use_offset>;
 };
+template <typename Mapped>
+struct KeyArray
+{
+    using MappedType = Mapped;
+
+    const IColumn * column;
+    const ColumnArray::Offsets * offsets;
+
+    KeyArray(const ColumnRawPtrs & key_columns, const Sizes & /*key_sizes*/, const Block * /*block*/)
+    {
+        column = key_columns[0];
+        const auto & array_column = static_cast<const ColumnArray &>(*column);
+        offsets = &array_column.getOffsets();
+        column = &array_column.getData();
+    }
+
+    template <typename Map>
+    void emplaceKey(Map & map, size_t i, Arena & pool, const Columns * stored_columns) const
+    {
+        size_t begin = i > 0 ? (*offsets)[i - 1] : 0;
+        size_t end = (*offsets)[i];
+
+        for (size_t j = begin; j < end; ++j)
+        {
+            auto key = column->getDataAt(j);
+            auto emplace_result = map.emplace(key, pool);
+            if (emplace_result.isInserted())
+                new (&emplace_result.getMapped()) Mapped();
+            *emplace_result.getMapped() = RowRef(stored_columns, i);
+        }
+    }
+
+    template <typename Map>
+    auto findKey(Map & map, size_t i, Arena & pool) const
+    {
+        size_t begin = i > 0 ? (*offsets)[i - 1] : 0;
+        size_t end = (*offsets)[i];
+
+        for (size_t j = begin; j < end; ++j)
+        {
+            auto key = column->getDataAt(j);
+            auto find_result = map.find(key, pool);
+            if (find_result)
+                return find_result;
+        }
+        return typename Map::LookupResult();
+    }
+};
+
 template <typename Value, typename Mapped> struct KeyGetterForTypeImpl<HashJoin::Type::hashed, Value, Mapped>
 {
     using Type = ColumnsHashing::HashMethodHashed<Value, Mapped, false, use_offset>;
 };
+
+template <typename Value, typename Mapped> struct KeyGetterForTypeImpl<HashJoin::Type::key_array, Value, Mapped>
+{
+    using Type = ColumnsHashing::HashMethodString<Value, Mapped, true, false, use_offset>;
+};
+
 template <typename Value, typename Mapped> struct KeyGetterForTypeImpl<HashJoin::Type::two_level_key32, Value, Mapped>
 {
     using Type = ColumnsHashing::HashMethodOneNumber<Value, Mapped, UInt32, false, use_offset>;

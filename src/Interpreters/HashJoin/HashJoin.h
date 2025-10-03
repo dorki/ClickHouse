@@ -210,6 +210,7 @@ public:
         M(keys128)                     \
         M(keys256)                     \
         M(hashed)                      \
+        M(key_array)                   \
         M(two_level_key32)             \
         M(two_level_key64)             \
         M(two_level_key_string)        \
@@ -278,6 +279,7 @@ public:
         std::shared_ptr<HashMap<UInt128, Mapped, UInt128HashCRC32>>           keys128;
         std::shared_ptr<HashMap<UInt256, Mapped, UInt256HashCRC32>>           keys256;
         std::shared_ptr<HashMap<UInt128, Mapped, UInt128TrivialHash>>         hashed;
+        std::shared_ptr<HashMap<StringRef, Mapped, StringRefHash>>            key_array;
         std::shared_ptr<TwoLevelHashMap<UInt32, Mapped, HashCRC32<UInt32>>>   two_level_key32;
         std::shared_ptr<TwoLevelHashMap<UInt64, Mapped, HashCRC32<UInt64>>>   two_level_key64;
         std::shared_ptr<TwoLevelHashMapWithSavedHash<StringRef, Mapped>>      two_level_key_string;

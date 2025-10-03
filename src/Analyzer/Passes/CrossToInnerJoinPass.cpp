@@ -49,6 +49,13 @@ void extractJoinConditions(const QueryTreeNodePtr & node, QueryTreeNodes & equi_
     {
         equi_conditions.push_back(node);
     }
+    else if (args.size() == 2 && func->getFunctionName() == "has")
+    {
+        auto equals_node = std::make_shared<FunctionNode>("equals");
+        equals_node->getArguments().getNodes().push_back(func->getArguments().getNodes()[1]);
+        equals_node->getArguments().getNodes().push_back(func->getArguments().getNodes()[0]);
+        equi_conditions.push_back(equals_node);
+    }
     else if (func->getFunctionName() == "and")
     {
         for (const auto & arg : args)
@@ -63,7 +70,14 @@ void extractJoinConditions(const QueryTreeNodePtr & node, QueryTreeNodes & equi_
 const QueryTreeNodePtr & getEquiArgument(const QueryTreeNodePtr & cond, size_t index)
 {
     const auto * func = cond->as<FunctionNode>();
-    chassert(func && func->getFunctionName() == "equals" && func->getArguments().getNodes().size() == 2);
+    chassert(func && (func->getFunctionName() == "equals" || func->getFunctionName() == "has") && func->getArguments().getNodes().size() == 2);
+    if (func->getFunctionName() == "has")
+    {
+        if (index == 0)
+            return func->getArguments().getNodes()[1];
+        else
+            return func->getArguments().getNodes()[0];
+    }
     return func->getArguments().getNodes()[index];
 }
 
@@ -146,7 +160,14 @@ public:
 
             bool is_useful = false;
 
-            DataTypes key_types = {lhs_equi_argument->getResultType(), rhs_equi_argument->getResultType()};
+            DataTypes key_types;
+            if (lhs_equi_argument->getResultType()->getTypeId() == TypeIndex::Array)
+                key_types = {lhs_equi_argument->getResultType()->getNestedType(), rhs_equi_argument->getResultType()};
+            else if (rhs_equi_argument->getResultType()->getTypeId() == TypeIndex::Array)
+                key_types = {lhs_equi_argument->getResultType(), rhs_equi_argument->getResultType()->getChildren()[0]};
+            else
+                key_types = {lhs_equi_argument->getResultType(), rhs_equi_argument->getResultType()};
+
             DataTypePtr common_key_type = tryGetLeastSupertype(key_types);
 
             /// If there is common key type, we can join on this condition

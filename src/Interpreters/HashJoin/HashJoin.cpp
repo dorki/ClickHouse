@@ -322,6 +322,9 @@ static HashJoin::Type chooseMethod(JoinKind kind, const ColumnRawPtrs & key_colu
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Numeric column has sizeOfField not in 1, 2, 4, 8, 16, 32.");
     }
 
+    if (keys_size == 1 && key_columns[0]->getTypeId() == TypeIndex::Array)
+        return Type::key_array;
+
     /// If the keys fit in N bits, we will use a hash table for N-bit-packed keys
     if (all_fixed && keys_bytes <= 16)
         return Type::keys128;
