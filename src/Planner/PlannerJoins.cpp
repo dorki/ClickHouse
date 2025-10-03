@@ -378,6 +378,77 @@ void buildJoinClauseImpl(
             }
         }
     }
+    else if (function_name == "has" && function_node->getArguments().getNodes().size() == 2)
+    {
+        /// Handle has(array_col, element_col) as an array join key
+        const auto array_child = function_node->getArguments().getNodes().at(0);
+        const auto element_child = function_node->getArguments().getNodes().at(1);
+
+        auto array_expression_sides
+            = extractJoinTableSidesFromExpression(array_child.get(), left_table_expressions, right_table_expressions, join_node);
+
+        auto element_expression_sides
+            = extractJoinTableSidesFromExpression(element_child.get(), left_table_expressions, right_table_expressions, join_node);
+
+        if (array_expression_sides.empty() && element_expression_sides.empty())
+        {
+            throw Exception(
+                ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+                "JOIN {} ON expression expected non-empty left and right table expressions",
+                join_node.formatASTForErrorMessage());
+        }
+
+        if (array_expression_sides.size() == 1 && element_expression_sides.size() == 1)
+        {
+            auto array_expression_side = *array_expression_sides.begin();
+            auto element_expression_side = *element_expression_sides.begin();
+
+            if (array_expression_side != element_expression_side)
+            {
+                /// Array and element are from different tables - this is array join key
+                auto array_key = array_child;
+                auto element_key = element_child;
+                bool left_is_array = (array_expression_side == JoinTableSide::Left);
+
+                /// Always put element on left, array on right for consistent key ordering
+                const auto * left_node = left_is_array
+                    ? appendExpression(left_dag, array_key, planner_context, join_node)
+                    : appendExpression(left_dag, element_key, planner_context, join_node);
+                const auto * right_node = left_is_array
+                    ? appendExpression(right_dag, element_key, planner_context, join_node)
+                    : appendExpression(right_dag, array_key, planner_context, join_node);
+
+                join_clause.addArrayJoinKey(left_node, right_node, left_is_array);
+            }
+            else
+            {
+                /// Both from same table - add as condition
+                auto expression_side = array_expression_side;
+                auto & dag = expression_side == JoinTableSide::Left ? left_dag : right_dag;
+                const auto * node = appendExpression(dag, join_expression, planner_context, join_node);
+                join_clause.addCondition(expression_side, node);
+            }
+        }
+        else
+        {
+            /// One of the expressions is not a simple column reference - treat as regular condition
+            auto expression_sides
+                = extractJoinTableSidesFromExpression(join_expression.get(), left_table_expressions, right_table_expressions, join_node);
+            if (expression_sides.empty() || expression_sides.size() == 1)
+            {
+                auto expression_side = expression_sides.empty() ? JoinTableSide::Right : *expression_sides.begin();
+                auto & dag = expression_side == JoinTableSide::Left ? left_dag : right_dag;
+                const auto * node = appendExpression(dag, join_expression, planner_context, join_node);
+                join_clause.addCondition(expression_side, node);
+            }
+            else
+            {
+                /// Expression involves both tables - add as residual
+                const auto * node = appendExpression(joined_dag, join_expression, planner_context, join_node);
+                join_clause.addResidualCondition(node);
+            }
+        }
+    }
     else
     {
         auto expression_sides

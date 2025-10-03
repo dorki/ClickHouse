@@ -57,6 +57,7 @@ public:
         void addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, JoinIdentifierPosPair table_pos, bool null_safe_comparison);
         void addAsofJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, JoinIdentifierPosPair table_pos,
                              const ASOFJoinInequality & asof_inequality);
+        void addArrayJoinKeys(const ASTPtr & array_ast, const ASTPtr & element_ast, JoinIdentifierPosPair table_pos);
         void asofToJoinKeys();
     };
 

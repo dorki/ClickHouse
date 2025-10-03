@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Columns/IColumn.h>
+#include <Columns/ColumnArray.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/HashJoin/AddedColumns.h>
 #include <Interpreters/HashJoin/HashJoinMethods.h>
@@ -16,6 +17,31 @@ namespace ErrorCodes
 {
 extern const int UNSUPPORTED_JOIN_KEYS;
 extern const int LOGICAL_ERROR;
+extern const int TYPE_MISMATCH;
+}
+
+namespace
+{
+    /// Helper to check if any key column is an array (for array join semantics)
+    /// Returns index of first array column, or -1 if none
+    ssize_t findArrayKeyColumn(const ColumnRawPtrs & key_columns, const TableJoin & table_join)
+    {
+        const auto & clauses = table_join.getClauses();
+        if (clauses.empty())
+            return -1;
+
+        const auto & clause = clauses[0];  /// For now, only support single clause
+        for (size_t i = 0; i < key_columns.size(); ++i)
+        {
+            if (clause.isArrayJoinKey(i))
+            {
+                /// Check if this is the array side (right side for build phase)
+                if (clause.rightIsArray(i))
+                    return static_cast<ssize_t>(i);
+            }
+        }
+        return -1;
+    }
 }
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
 void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
@@ -181,6 +207,12 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
     else
         rows = selector.second - selector.first;
 
+    /// Check if we have array join keys that need expansion
+    ssize_t array_key_index = findArrayKeyColumn(key_columns, *join.table_join);
+    const ColumnArray * array_column = nullptr;
+    if (array_key_index >= 0)
+        array_column = typeid_cast<const ColumnArray *>(key_columns[array_key_index]);
+
     for (size_t i = 0; i < rows; ++i)
     {
         size_t ind = 0;
@@ -202,12 +234,72 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
         if (join_mask.isRowFiltered(ind))
             continue;
 
-        if constexpr (is_asof_join)
-            Inserter<HashMap, KeyGetter>::insertAsof(join, map, key_getter, stored_columns, ind, pool, *asof_column);
-        else if constexpr (mapped_one)
-            is_inserted |= Inserter<HashMap, KeyGetter>::insertOne(join, map, key_getter, stored_columns, ind, pool);
+        /// Handle array join key expansion
+        if (array_column)
+        {
+            /// Get array elements for this row
+            const auto & offsets = array_column->getOffsets();
+            size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
+            size_t array_end = offsets[ind];
+
+            /// For each element in the array, insert a hash table entry with the element value
+            /// All entries point to the same row (ind) in stored_columns
+            const IColumn & array_data = array_column->getData();
+
+            /// Create temporary key columns with array data column substituted
+            ColumnRawPtrs expanded_key_columns = key_columns;
+            expanded_key_columns[array_key_index] = &array_data;
+
+            /// Create temporary key sizes (array data column has same size as array column's data)
+            Sizes expanded_key_sizes = key_sizes;
+
+            /// Create key getter once with expanded columns (array data instead of array)
+            auto elem_key_getter = createKeyGetter<KeyGetter, is_asof_join>(expanded_key_columns, expanded_key_sizes);
+
+            /// For each element in the array, compute hash and insert
+            for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+            {
+                /// Extract key from array element position elem_idx
+                auto emplace_result = elem_key_getter.emplaceKey(map, elem_idx, pool);
+
+                /// Store reference to original row (ind), not the element position
+                if constexpr (is_asof_join)
+                {
+                    typename HashMap::mapped_type * time_series_map = &emplace_result.getMapped();
+                    TypeIndex asof_type = *join.getAsofType();
+                    if (emplace_result.isInserted())
+                        time_series_map = new (time_series_map) typename HashMap::mapped_type(createAsofRowRef(asof_type, join.getAsofInequality()));
+                    (*time_series_map)->insert(*asof_column, stored_columns, ind);
+                    is_inserted |= emplace_result.isInserted();
+                }
+                else if constexpr (mapped_one)
+                {
+                    if (emplace_result.isInserted() || join.anyTakeLastRow())
+                    {
+                        new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                        is_inserted = true;
+                    }
+                }
+                else
+                {
+                    if (emplace_result.isInserted())
+                        new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                    else
+                        emplace_result.getMapped().insert({stored_columns, ind}, pool);
+                    all_values_unique &= emplace_result.isInserted();
+                }
+            }
+        }
         else
-            all_values_unique &= Inserter<HashMap, KeyGetter>::insertAll(join, map, key_getter, stored_columns, ind, pool);
+        {
+            /// Normal non-array join
+            if constexpr (is_asof_join)
+                Inserter<HashMap, KeyGetter>::insertAsof(join, map, key_getter, stored_columns, ind, pool, *asof_column);
+            else if constexpr (mapped_one)
+                is_inserted |= Inserter<HashMap, KeyGetter>::insertOne(join, map, key_getter, stored_columns, ind, pool);
+            else
+                all_values_unique &= Inserter<HashMap, KeyGetter>::insertAll(join, map, key_getter, stored_columns, ind, pool);
+        }
     }
 }
 

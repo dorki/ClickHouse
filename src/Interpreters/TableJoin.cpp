@@ -278,6 +278,20 @@ void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, boo
     right_key_aliases[right_table_ast->getColumnName()] = right_table_ast->getAliasOrColumnName();
 }
 
+void TableJoin::addOnArrayJoinKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool left_is_array)
+{
+    assertHasOneOnExpr();
+
+    String left_name = left_table_ast->getColumnName();
+    String right_name = right_table_ast->getAliasOrColumnName();
+
+    key_asts_left.push_back(left_table_ast);
+    key_asts_right.push_back(right_table_ast);
+
+    clauses.back().addArrayJoinKey(left_name, right_name, left_is_array);
+    right_key_aliases[right_table_ast->getColumnName()] = right_name;
+}
+
 /// @return how many times right key appears in ON section.
 size_t TableJoin::rightKeyInclusion(const String & name) const
 {

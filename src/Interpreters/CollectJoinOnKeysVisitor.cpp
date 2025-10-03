@@ -73,6 +73,28 @@ void CollectJoinOnKeysMatcher::Data::addAsofJoinKeys(const ASTPtr & left_ast, co
     }
 }
 
+void CollectJoinOnKeysMatcher::Data::addArrayJoinKeys(const ASTPtr & array_ast, const ASTPtr & element_ast, JoinIdentifierPosPair table_pos)
+{
+    ASTPtr array = array_ast->clone();
+    ASTPtr element = element_ast->clone();
+
+    /// Determine which side has the array (first arg of has()) and which has the element (second arg)
+    /// table_pos.first corresponds to array_ast, table_pos.second corresponds to element_ast
+    if (isLeftIdentifier(table_pos.first) && isRightIdentifier(table_pos.second))
+    {
+        /// has(left.array_col, right.element_col) -> left is array, right is element
+        analyzed_join.addOnArrayJoinKeys(array, element, true);
+    }
+    else if (isRightIdentifier(table_pos.first) && isLeftIdentifier(table_pos.second))
+    {
+        /// has(right.array_col, left.element_col) -> right is array, left is element
+        /// Swap them so left/right keys align properly
+        analyzed_join.addOnArrayJoinKeys(element, array, false);
+    }
+    else
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot detect left and right JOIN keys for array join. JOIN ON section is ambiguous.");
+}
+
 void CollectJoinOnKeysMatcher::Data::asofToJoinKeys()
 {
     if (!asof_left_key || !asof_right_key)
@@ -122,6 +144,30 @@ void CollectJoinOnKeysMatcher::visit(const ASTFunction & func, const ASTPtr & as
         {
             bool null_safe_comparison = func.name == "isNotDistinctFrom";
             data.addJoinKeys(left, right, table_numbers, null_safe_comparison);
+            return;
+        }
+    }
+
+    /// Handle has(array_col, element_col) as an array join key
+    if (func.name == "has" && func.arguments->children.size() == 2)
+    {
+        ASTPtr array_arg = func.arguments->children.at(0);
+        ASTPtr element_arg = func.arguments->children.at(1);
+        auto table_numbers = getTableNumbers(array_arg, element_arg, data);
+
+        if (table_numbers.first == table_numbers.second)
+        {
+            if (!isDeterminedIdentifier(table_numbers.first))
+                throw Exception(ErrorCodes::AMBIGUOUS_COLUMN_NAME,
+                    "Ambiguous columns in expression '{}' in JOIN ON section", ast->formatForErrorMessage());
+            data.analyzed_join.addJoinCondition(ast, isLeftIdentifier(table_numbers.first));
+            return;
+        }
+
+        if ((isLeftIdentifier(table_numbers.first) && isRightIdentifier(table_numbers.second)) ||
+            (isRightIdentifier(table_numbers.first) && isLeftIdentifier(table_numbers.second)))
+        {
+            data.addArrayJoinKeys(array_arg, element_arg, table_numbers);
             return;
         }
     }
