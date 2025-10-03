@@ -1,4 +1,7 @@
 -- Test has() function in JOIN ON clause for array join semantics
+-- This test verifies:
+-- 1. Correctness: Results match expected output
+-- 2. Algorithm: Hash join is used instead of cross join
 -- Tags: no-parallel
 
 DROP TABLE IF EXISTS t1;
@@ -11,6 +14,23 @@ CREATE TABLE t2 (arr Array(UInt32), value String) ENGINE = Memory;
 -- Insert test data
 INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'David'), (5, 'Eve');
 INSERT INTO t2 VALUES ([1, 2, 3], 'Group A'), ([2, 4], 'Group B'), ([5], 'Group C'), ([], 'Empty Group');
+
+-- ========================================
+-- ALGORITHM VERIFICATION
+-- ========================================
+
+-- Verify that EXPLAIN shows Join (not Cross) for has() in JOIN ON
+SELECT '=== EXPLAIN Verification ===';
+EXPLAIN
+SELECT t1.id FROM t1 INNER JOIN t2 ON has(t2.arr, t1.id)
+SETTINGS enable_analyzer = 0
+FORMAT TSVRaw;
+
+SELECT '=== End EXPLAIN ===';
+
+-- ========================================
+-- CORRECTNESS TESTS
+-- ========================================
 
 -- Test 1: Basic INNER JOIN with has()
 SELECT t1.id, t1.name, t2.value
@@ -94,6 +114,16 @@ INNER JOIN t2 ON has(t2.arr, t6.id)
 ORDER BY t6.id;
 
 -- Expected: Empty result (no matches)
+
+-- ========================================
+-- MANUAL VERIFICATION GUIDE
+-- ========================================
+-- To manually verify hash join is used:
+-- 1. Check EXPLAIN output above - should show "Join" without "Cross"
+-- 2. Compare execution time with cross join:
+--    - Hash join: O(M * avg_array_len + N) - fast
+--    - Cross join: O(M * N) - slow
+-- 3. Run: EXPLAIN PIPELINE SELECT ... to see join step details
 
 -- Cleanup
 DROP TABLE IF EXISTS t1;
