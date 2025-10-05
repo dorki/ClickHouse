@@ -2067,6 +2067,10 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
                 table_join_clause.addKey(join_clause_left_key_nodes[i]->result_name,
                                          join_clause_right_key_nodes[i]->result_name,
                                          join_clause.isNullsafeCompareKey(i));
+
+                /// Copy array join key information
+                if (join_clause.isArrayJoinKey(i))
+                    table_join_clause.array_join_key_indexes[i] = join_clause.leftIsArray(i);
             }
 
             const auto & join_clause_get_left_filter_condition_nodes = join_clause.getLeftFilterConditionNodes();
@@ -2250,7 +2254,10 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(
 
     const auto & query_context = planner_context->getQueryContext();
     const auto & settings = query_context->getSettingsRef();
-    if (!settings[Setting::query_plan_use_new_logical_join_step])
+
+    bool use_legacy_path = !settings[Setting::query_plan_use_new_logical_join_step];
+
+    if (use_legacy_path)
         return buildQueryPlanForJoinNodeLegacy(
             join_table_expression, std::move(left_join_tree_query_plan), std::move(right_join_tree_query_plan), outer_scope_columns, planner_context, select_query_info, max_step_description_length);
 

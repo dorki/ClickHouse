@@ -11,6 +11,7 @@
 #include <Core/Settings.h>
 #include <Common/logger_useful.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <Functions/IFunctionAdaptors.h>
@@ -113,7 +114,13 @@ bool forAllKeys(OnExpr & expressions, Func callback)
         {
             bool cont;
             if constexpr (std::is_same_v<SideTag, BothSidesTag>)
-                cont = callback(expr.key_names_left[i], expr.key_names_right[i]);
+            {
+                /// Check if callback accepts clause and index parameters
+                if constexpr (std::is_invocable_v<Func, const String&, const String&, const decltype(expr)&, size_t>)
+                    cont = callback(expr.key_names_left[i], expr.key_names_right[i], expr, i);
+                else
+                    cont = callback(expr.key_names_left[i], expr.key_names_right[i]);
+            }
             if constexpr (std::is_same_v<SideTag, LeftSideTag>)
                 cont = callback(expr.key_names_left[i]);
             if constexpr (std::is_same_v<SideTag, RightSideTag>)
@@ -276,6 +283,18 @@ void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, boo
 {
     addKey(left_table_ast->getColumnName(), right_table_ast->getAliasOrColumnName(), left_table_ast, right_table_ast, null_safe_comparison);
     right_key_aliases[right_table_ast->getColumnName()] = right_table_ast->getAliasOrColumnName();
+}
+
+void TableJoin::addOnArrayJoinKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool left_is_array)
+{
+    String left_name = left_table_ast->getColumnName();
+    String right_name = right_table_ast->getAliasOrColumnName();
+
+    key_asts_left.push_back(left_table_ast);
+    key_asts_right.push_back(right_table_ast);
+
+    clauses.back().addArrayJoinKey(left_name, right_name, left_is_array);
+    right_key_aliases[right_table_ast->getColumnName()] = right_name;
 }
 
 /// @return how many times right key appears in ON section.
@@ -801,7 +820,7 @@ void TableJoin::inferJoinKeyCommonType(const LeftNamesAndTypes & left, const Rig
             throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "ASOF join over multiple keys is not supported");
     }
 
-    forAllKeys(clauses, [&](const auto & left_key_name, const auto & right_key_name)
+    forAllKeys(clauses, [&](const auto & left_key_name, const auto & right_key_name, const auto & clause, size_t i)
     {
         auto ltypeit = left_types.find(left_key_name);
         auto rtypeit = right_types.find(right_key_name);
@@ -812,8 +831,70 @@ void TableJoin::inferJoinKeyCommonType(const LeftNamesAndTypes & left, const Rig
             right_type_map.clear();
             return false;
         }
-        const auto & ltype = ltypeit->second;
-        const auto & rtype = rtypeit->second;
+
+        DataTypePtr ltype = ltypeit->second;
+        DataTypePtr rtype = rtypeit->second;
+
+        /// Handle array join keys - need to compare element type with scalar type
+        if (clause.isArrayJoinKey(i))
+        {
+            bool left_is_array = clause.leftIsArray(i);
+            const auto & array_type_ptr = left_is_array ? ltype : rtype;
+            const auto & scalar_type_ptr = left_is_array ? rtype : ltype;
+
+            /// Extract element type from Array(T)
+            const auto * array_type = typeid_cast<const DataTypeArray *>(array_type_ptr.get());
+            if (!array_type)
+            {
+                throw DB::Exception(ErrorCodes::TYPE_MISMATCH,
+                    "Array join key {} should have Array type but has type {}",
+                    left_is_array ? left_key_name : right_key_name,
+                    array_type_ptr->getName());
+            }
+
+            const auto & element_type = array_type->getNestedType();
+
+            /// Find common type between array element type and scalar type
+            bool type_equals = require_strict_keys_match ? element_type->equals(*scalar_type_ptr) : JoinCommon::typesEqualUpToNullability(element_type, scalar_type_ptr);
+            if (type_equals)
+                return true;
+
+            DataTypePtr common_type;
+            try
+            {
+                common_type = DB::getLeastSupertype(DataTypes{element_type, scalar_type_ptr});
+            }
+            catch (DB::Exception & ex)
+            {
+                throw DB::Exception(ErrorCodes::TYPE_MISMATCH,
+                    "Can't infer common type for array join keys: array element type {}, scalar {}: {}. {}",
+                    element_type->getName(),
+                    left_is_array ? right_key_name : left_key_name,
+                    scalar_type_ptr->getName(),
+                    ex.message());
+            }
+
+            /// Cast array to Array(common_type) if element type differs
+            if (!element_type->equals(*common_type))
+            {
+                auto target_array_type = std::make_shared<DataTypeArray>(common_type);
+                if (left_is_array)
+                    left_type_map[left_key_name] = target_array_type;
+                else
+                    right_type_map[right_key_name] = target_array_type;
+            }
+
+            /// Cast scalar to common_type if needed
+            if (!scalar_type_ptr->equals(*common_type))
+            {
+                if (left_is_array)
+                    right_type_map[right_key_name] = common_type;
+                else
+                    left_type_map[left_key_name] = common_type;
+            }
+
+            return true;
+        }
 
         bool type_equals = require_strict_keys_match ? ltype->equals(*rtype) : JoinCommon::typesEqualUpToNullability(ltype, rtype);
         if (type_equals)

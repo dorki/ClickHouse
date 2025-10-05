@@ -67,6 +67,14 @@ public:
           */
         std::unordered_set<size_t> nullsafe_compare_key_indexes;
 
+        /** Track which keys use array join semantics: has(array_col, element_col)
+          * For key at index i, if present in this map:
+          *   - true means left side is array, right side is element
+          *   - false means right side is array, left side is element
+          * Example: JOIN ON has(t2.arr, t1.id) creates entry {i, false} (right is array)
+          */
+        std::unordered_map<size_t, bool> array_join_key_indexes;
+
         ASTPtr on_filter_condition_left;
         ASTPtr on_filter_condition_right;
 
@@ -81,6 +89,31 @@ public:
             key_names_right.push_back(right_name);
             if (null_safe_comparison)
                 nullsafe_compare_key_indexes.insert(key_names_left.size() - 1);
+        }
+
+        void addArrayJoinKey(const String & left_name, const String & right_name, bool left_is_array)
+        {
+            size_t key_index = key_names_left.size();
+            key_names_left.push_back(left_name);
+            key_names_right.push_back(right_name);
+            array_join_key_indexes[key_index] = left_is_array;
+        }
+
+        bool isArrayJoinKey(size_t key_index) const
+        {
+            return array_join_key_indexes.contains(key_index);
+        }
+
+        bool leftIsArray(size_t key_index) const
+        {
+            auto it = array_join_key_indexes.find(key_index);
+            return it != array_join_key_indexes.end() && it->second;
+        }
+
+        bool rightIsArray(size_t key_index) const
+        {
+            auto it = array_join_key_indexes.find(key_index);
+            return it != array_join_key_indexes.end() && !it->second;
         }
 
         std::pair<String, String> condColumnNames() const
@@ -341,6 +374,8 @@ public:
     void addDisjunct();
 
     void addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool null_safe_comparison);
+
+    void addOnArrayJoinKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool left_is_array);
 
     /* Conditions for left/right table from JOIN ON section.
      *

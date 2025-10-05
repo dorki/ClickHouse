@@ -9,6 +9,7 @@
 #include <Core/Joins.h>
 #include <Core/Settings.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
 
 #include <Functions/FunctionFactory.h>
@@ -455,6 +456,71 @@ void predicateOperandsToCommonType(JoinActionRef & left_node, JoinActionRef & ri
     }
 }
 
+void predicateOperandsToCommonTypeForArrayJoin(
+    JoinActionRef & array_node,
+    JoinActionRef & scalar_node,
+    const JoinPlanningContext & planning_context)
+{
+    /// Extract element type from Array(T)
+    const auto * array_type = typeid_cast<const DataTypeArray *>(array_node.getType().get());
+    if (!array_type)
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Array join key '{}' should have Array type but has type {}",
+            array_node.getColumnName(),
+            array_node.getType()->getName());
+    }
+
+    const auto & element_type = array_type->getNestedType();
+    const auto & scalar_type = scalar_node.getType();
+
+    /// If types already match, no casting needed
+    if (element_type->equals(*scalar_type))
+        return;
+
+    /// Find common type between array element type and scalar type
+    DataTypePtr common_type;
+    try
+    {
+        common_type = getLeastSupertype(DataTypes{element_type, scalar_type});
+    }
+    catch (Exception & ex)
+    {
+        ex.addMessage("JOIN cannot infer common type in ON section for array join keys. Array '{}' element type {}. Scalar key '{}' type {}",
+            array_node.getColumnName(), element_type->getName(),
+            scalar_node.getColumnName(), scalar_type->getName());
+        throw;
+    }
+
+    auto cast_transform = [&common_type, &planning_context](auto & dag, auto && nodes)
+    {
+        auto arg = nodes.at(0);
+        auto mapped_it = planning_context.actions_after_join_map.find(arg->result_name);
+        if (mapped_it != planning_context.actions_after_join_map.end() && mapped_it->second->result_type->equals(*common_type))
+            return mapped_it->second;
+        return &dag.addCast(*arg, common_type, {});
+    };
+
+    /// Cast array to Array(common_type) if element type differs
+    if (!element_type->equals(*common_type))
+    {
+        auto target_array_type = std::make_shared<DataTypeArray>(common_type);
+        array_node = JoinActionRef::transform({array_node},
+            [&target_array_type, &planning_context](auto & dag, auto && nodes)
+            {
+                auto arg = nodes.at(0);
+                auto mapped_it = planning_context.actions_after_join_map.find(arg->result_name);
+                if (mapped_it != planning_context.actions_after_join_map.end() && mapped_it->second->result_type->equals(*target_array_type))
+                    return mapped_it->second;
+                return &dag.addCast(*arg, target_array_type, {});
+            });
+    }
+
+    /// Cast scalar to common_type if needed
+    if (!scalar_type->equals(*common_type))
+        scalar_node = JoinActionRef::transform({scalar_node}, cast_transform);
+}
+
 bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, TableJoin::JoinOnClause & table_join_clause,
     std::vector<JoinActionRef> & used_expressions, const JoinPlanningContext & planning_context)
 {
@@ -464,6 +530,54 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
     for (auto & pred : predicates)
     {
         auto & predicate = new_predicates.emplace_back(std::move(pred));
+
+        /// Check for has(array_col, element_col) - array join semantics
+        const auto * node = predicate.getNode();
+        if (node && node->function_base && node->function_base->getName() == "has" && node->children.size() == 2)
+        {
+            /// Get arguments from the has() function's children
+            auto lhs_args = predicate.getArguments();
+            if (lhs_args.size() == 2)
+            {
+                auto lhs = lhs_args[0];
+                auto rhs = lhs_args[1];
+
+                /// Ensure one arg is from left and one from right
+                if ((lhs.fromLeft() && rhs.fromRight()) || (lhs.fromRight() && rhs.fromLeft()))
+                {
+                    if (lhs.fromRight() && rhs.fromLeft())
+                        std::swap(lhs, rhs);
+
+                    /// Determine which side is the array
+                    bool left_is_array = typeid_cast<const DataTypeArray *>(lhs.getType().get()) != nullptr;
+                    bool right_is_array = typeid_cast<const DataTypeArray *>(rhs.getType().get()) != nullptr;
+
+                    if (left_is_array && !right_is_array)
+                    {
+                        /// has(left_array, right_scalar) - left is array
+                        predicateOperandsToCommonTypeForArrayJoin(lhs, rhs, planning_context);
+                        has_join_predicates = true;
+                        table_join_clause.addArrayJoinKey(lhs.getColumnName(), rhs.getColumnName(), true);
+                        used_expressions.push_back(lhs);
+                        used_expressions.push_back(rhs);
+                        new_predicates.pop_back();
+                        continue;
+                    }
+                    else if (right_is_array && !left_is_array)
+                    {
+                        /// has(right_array, left_scalar) - right is array
+                        predicateOperandsToCommonTypeForArrayJoin(rhs, lhs, planning_context);
+                        has_join_predicates = true;
+                        table_join_clause.addArrayJoinKey(lhs.getColumnName(), rhs.getColumnName(), false);
+                        used_expressions.push_back(lhs);
+                        used_expressions.push_back(rhs);
+                        new_predicates.pop_back();
+                        continue;
+                    }
+                }
+            }
+        }
+
         auto [predicate_op, lhs, rhs] = predicate.asBinaryPredicate();
         if (predicate_op != JoinConditionOperator::Equals && predicate_op != JoinConditionOperator::NullSafeEquals)
             continue;

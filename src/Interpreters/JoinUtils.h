@@ -91,11 +91,13 @@ void checkTypesOfMasks(const Block & block_left, const String & condition_name_l
 
 /// Throw an exception if blocks have different types of key columns . Compare up to Nullability.
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
-                      const Block & block_right, const Names & key_names_right);
+                      const Block & block_right, const Names & key_names_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes = nullptr);
 
 /// Check both keys and conditions
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left, const String & condition_name_left,
-                      const Block & block_right, const Names & key_names_right, const String & condition_name_right);
+                      const Block & block_right, const Names & key_names_right, const String & condition_name_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes = nullptr);
 
 void createMissedColumns(Block & block);
 void joinTotals(Block left_totals, Block right_totals, const TableJoin & table_join, Block & out_block);

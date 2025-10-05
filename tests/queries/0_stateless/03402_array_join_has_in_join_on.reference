@@ -1,0 +1,32 @@
+1	Alice	Group A
+2	Bob	Group A
+2	Bob	Group B
+3	Charlie	Group A
+4	David	Group B
+5	Eve	Group C
+1	Alice	Group A
+2	Bob	Group A
+2	Bob	Group B
+3	Charlie	Group A
+4	David	Group B
+5	Eve	Group C
+0		Empty Group
+1	Alice	Group A
+2	Bob	Group A
+2	Bob	Group B
+3	Charlie	Group A
+4	David	Group B
+5	Eve	Group C
+1	10	Ten
+1	20	Twenty
+1	30	Thirty
+2	20	Twenty-B
+3	30	Thirty
+1	Alice	Group A
+2	Bob	Group A
+2	Bob	Group B
+3	Charlie	Group A
+4	David	Group B
+5	Eve	Group C
+2	Group A
+2	Group B
