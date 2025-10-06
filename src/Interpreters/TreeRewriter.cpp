@@ -703,7 +703,7 @@ void collectJoinedColumns(TableJoin & analyzed_join, ASTTableJoin & table_join,
 
         bool is_asof = (table_join.strictness == JoinStrictness::Asof);
 
-        CollectJoinOnKeysVisitor::Data data{analyzed_join, tables[0], tables[1], aliases, is_asof};
+        CollectJoinOnKeysVisitor::Data data{analyzed_join, tables[0], tables[1], aliases, is_asof, {}, {}, {}};
         if (auto * or_func = table_join.on_expression->as<ASTFunction>(); or_func && or_func->name == "or")
         {
             for (auto & disjunct : or_func->arguments->children)
@@ -718,6 +718,12 @@ void collectJoinedColumns(TableJoin & analyzed_join, ASTTableJoin & table_join,
             analyzed_join.addDisjunct();
             CollectJoinOnKeysVisitor(data).visit(table_join.on_expression);
             assert(analyzed_join.oneDisjunct());
+        }
+
+        /// After visitor finishes: if first_has_ref is still set, process it as array join key
+        if (data.first_has_ref.has_value)
+        {
+            data.addArrayJoinKeys(data.first_has_ref.array_ast, data.first_has_ref.element_ast, data.first_has_ref.table_pos);
         }
 
         auto check_keys_empty = [] (auto e) { return e.key_names_left.empty(); };

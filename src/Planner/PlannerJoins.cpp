@@ -549,7 +549,14 @@ void buildSimpleJoinClause(
         join_clause);
 }
 
-void buildJoinClause(
+/// Track first has() predicate for single-pass algorithm
+struct FirstHasInfo
+{
+    QueryTreeNodePtr original_expression;
+    bool has_value = false;
+};
+
+void buildJoinClauseWithTracking(
     ActionsDAG & left_dag,
     ActionsDAG & right_dag,
     ActionsDAG & joined_dag,
@@ -558,15 +565,16 @@ void buildJoinClause(
     const TableExpressionSet & left_table_expressions,
     const TableExpressionSet & right_table_expressions,
     const JoinNode & join_node,
-    JoinClause & join_clause)
+    JoinClause & join_clause,
+    FirstHasInfo & first_has_ref)
 {
     std::string function_name;
     auto * function_node = join_expression->as<FunctionNode>();
     if (function_node)
     {
         function_name = function_node->getFunction()->getName();
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClause: function_name from getFunction()->getName() = '{}'", function_name);
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClause: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunction()->getName() = '{}'", function_name);
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
     }
 
     /// For 'and' function go into children
@@ -574,7 +582,7 @@ void buildJoinClause(
     {
         for (const auto & child : function_node->getArguments())
         {
-            buildJoinClause(
+            buildJoinClauseWithTracking(
                 left_dag,
                 right_dag,
                 joined_dag,
@@ -583,12 +591,85 @@ void buildJoinClause(
                 left_table_expressions,
                 right_table_expressions,
                 join_node,
-                join_clause);
+                join_clause,
+                first_has_ref);
         }
 
         return;
     }
 
+    /// Check if this is an equality predicate
+    bool is_equality = (function_name == "equals" || function_name == "isNotDistinctFrom");
+
+    /// Check if this is a has() predicate
+    bool is_has = (function_name == "has" && function_node && function_node->getArguments().getNodes().size() == 2);
+
+    if (is_equality)
+    {
+        /// Process equality - will add as join key in buildJoinClauseImpl
+        buildJoinClauseImpl(
+            left_dag,
+            right_dag,
+            joined_dag,
+            planner_context,
+            join_expression,
+            left_table_expressions,
+            right_table_expressions,
+            join_node,
+            false,
+            join_clause);
+
+        /// If we had saved a has() ref, process it as post-filter now since we found an equality
+        if (first_has_ref.has_value)
+        {
+            buildJoinClauseImpl(
+                left_dag,
+                right_dag,
+                joined_dag,
+                planner_context,
+                first_has_ref.original_expression,
+                left_table_expressions,
+                right_table_expressions,
+                join_node,
+                false,
+                join_clause);
+            first_has_ref.has_value = false;
+        }
+        return;
+    }
+    else if (is_has)
+    {
+        /// Check if this is the first has() and no keys added yet
+        bool no_keys_yet = join_clause.getLeftKeyNodes().empty();
+
+        if (!first_has_ref.has_value && no_keys_yet)
+        {
+            /// Save this as potential array join key
+            first_has_ref.original_expression = join_expression;
+            first_has_ref.has_value = true;
+            /// Don't process yet - wait to see if equality comes
+            return;
+        }
+        else
+        {
+            /// Either not first has(), or keys already exist, or first_has was invalidated
+            /// Process as regular condition (will become post-filter)
+            buildJoinClauseImpl(
+                left_dag,
+                right_dag,
+                joined_dag,
+                planner_context,
+                join_expression,
+                left_table_expressions,
+                right_table_expressions,
+                join_node,
+                false,
+                join_clause);
+            return;
+        }
+    }
+
+    /// Other predicates - process normally
     buildJoinClauseImpl(
         left_dag,
         right_dag,
@@ -600,6 +681,48 @@ void buildJoinClause(
         join_node,
         false,
         join_clause);
+}
+
+void buildJoinClause(
+    ActionsDAG & left_dag,
+    ActionsDAG & right_dag,
+    ActionsDAG & joined_dag,
+    const PlannerContextPtr & planner_context,
+    const QueryTreeNodePtr & join_expression,
+    const TableExpressionSet & left_table_expressions,
+    const TableExpressionSet & right_table_expressions,
+    const JoinNode & join_node,
+    JoinClause & join_clause)
+{
+    FirstHasInfo first_has_ref;
+
+    buildJoinClauseWithTracking(
+        left_dag,
+        right_dag,
+        joined_dag,
+        planner_context,
+        join_expression,
+        left_table_expressions,
+        right_table_expressions,
+        join_node,
+        join_clause,
+        first_has_ref);
+
+    /// After recursion finishes: if first_has_ref is still set, process it as array join key
+    if (first_has_ref.has_value)
+    {
+        buildJoinClauseImpl(
+            left_dag,
+            right_dag,
+            joined_dag,
+            planner_context,
+            first_has_ref.original_expression,
+            left_table_expressions,
+            right_table_expressions,
+            join_node,
+            false,
+            join_clause);
+    }
 }
 
 JoinClauses buildJoinClauses(

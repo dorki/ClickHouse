@@ -527,9 +527,69 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
     bool has_join_predicates = false;
     std::vector<JoinActionRef> new_predicates;
 
+    /// Track first has() predicate that might be used as array join key
+    struct FirstHasInfo
+    {
+        JoinActionRef predicate = nullptr;
+        JoinActionRef lhs = nullptr;
+        JoinActionRef rhs = nullptr;
+        bool left_is_array = false;
+        bool has_value = false;
+    };
+    FirstHasInfo first_has_ref;
+
     for (auto & pred : predicates)
     {
-        auto & predicate = new_predicates.emplace_back(std::move(pred));
+        JoinActionRef predicate = std::move(pred);
+
+        /// First, check for equality conditions - these take priority
+        auto [predicate_op, eq_lhs, eq_rhs] = predicate.asBinaryPredicate();
+        if (predicate_op == JoinConditionOperator::Equals || predicate_op == JoinConditionOperator::NullSafeEquals)
+        {
+            if (eq_lhs.fromRight() && eq_rhs.fromLeft())
+                std::swap(eq_lhs, eq_rhs);
+
+            if (eq_lhs.fromLeft() && eq_rhs.fromRight())
+            {
+                /// Found an equality condition - add as join key
+                predicateOperandsToCommonType(eq_lhs, eq_rhs, planning_context);
+                bool null_safe_comparison = JoinConditionOperator::NullSafeEquals == predicate_op;
+                if (null_safe_comparison && isNullableOrLowCardinalityNullable(eq_lhs.getType()) && isNullableOrLowCardinalityNullable(eq_rhs.getType()))
+                {
+                    /**
+                        * In case of null-safe comparison (a IS NOT DISTINCT FROM b),
+                        * we need to wrap keys with a non-nullable type.
+                        * The type `tuple` can be used for this purpose,
+                        * because value tuple(NULL) is not NULL itself (moreover it has type Tuple(Nullable(T) which is not Nullable).
+                        * Thus, join algorithm will match keys with values tuple(NULL).
+                        * Example:
+                        *   SELECT * FROM t1 JOIN t2 ON t1.a <=> t2.b
+                        * This will be semantically transformed to:
+                        *   SELECT * FROM t1 JOIN t2 ON tuple(t1.a) == tuple(t2.b)
+                        */
+
+                    JoinActionRef::AddFunction wrap_nullsafe_function(std::make_shared<FunctionTuple>());
+                    eq_lhs = JoinActionRef::transform({eq_lhs}, wrap_nullsafe_function);
+                    eq_rhs = JoinActionRef::transform({eq_rhs}, wrap_nullsafe_function);
+                }
+
+                has_join_predicates = true;
+                // std::cerr << "Adding key " << eq_lhs.getColumnName() << ' ' << eq_rhs.getColumnName() << std::endl;
+                table_join_clause.addKey(eq_lhs.getColumnName(), eq_rhs.getColumnName(), null_safe_comparison);
+
+                /// We applied predicate, do not add it to residual conditions
+                used_expressions.push_back(eq_lhs);
+                used_expressions.push_back(eq_rhs);
+
+                /// If we had saved a has() ref, add it to post-filters now since we found an equality
+                if (first_has_ref.has_value)
+                {
+                    new_predicates.emplace_back(std::move(first_has_ref.predicate));
+                    first_has_ref.has_value = false;
+                }
+                continue;
+            }
+        }
 
         /// Check for has(array_col, element_col) - array join semantics
         const auto * node = predicate.getNode();
@@ -552,70 +612,57 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
                     bool left_is_array = typeid_cast<const DataTypeArray *>(lhs.getType().get()) != nullptr;
                     bool right_is_array = typeid_cast<const DataTypeArray *>(rhs.getType().get()) != nullptr;
 
-                    if (left_is_array && !right_is_array)
+                    if ((left_is_array && !right_is_array) || (right_is_array && !left_is_array))
                     {
-                        /// has(left_array, right_scalar) - left is array
-                        predicateOperandsToCommonTypeForArrayJoin(lhs, rhs, planning_context);
-                        has_join_predicates = true;
-                        table_join_clause.addArrayJoinKey(lhs.getColumnName(), rhs.getColumnName(), true);
-                        used_expressions.push_back(lhs);
-                        used_expressions.push_back(rhs);
-                        new_predicates.pop_back();
-                        continue;
-                    }
-                    else if (right_is_array && !left_is_array)
-                    {
-                        /// has(right_array, left_scalar) - right is array
-                        predicateOperandsToCommonTypeForArrayJoin(rhs, lhs, planning_context);
-                        has_join_predicates = true;
-                        table_join_clause.addArrayJoinKey(lhs.getColumnName(), rhs.getColumnName(), false);
-                        used_expressions.push_back(lhs);
-                        used_expressions.push_back(rhs);
-                        new_predicates.pop_back();
-                        continue;
+                        /// Check if this is the first has() and no keys added yet
+                        if (!first_has_ref.has_value && table_join_clause.key_names_left.empty())
+                        {
+                            /// Save this as potential array join key
+                            first_has_ref.predicate = predicate;
+                            first_has_ref.lhs = lhs;
+                            first_has_ref.rhs = rhs;
+                            first_has_ref.left_is_array = left_is_array;
+                            first_has_ref.has_value = true;
+                            /// Don't add to new_predicates yet
+                            continue;
+                        }
+                        else
+                        {
+                            /// Either not first has(), or keys already exist
+                            /// Add as post-filter
+                            new_predicates.emplace_back(std::move(predicate));
+                            continue;
+                        }
                     }
                 }
             }
         }
 
-        auto [predicate_op, lhs, rhs] = predicate.asBinaryPredicate();
-        if (predicate_op != JoinConditionOperator::Equals && predicate_op != JoinConditionOperator::NullSafeEquals)
-            continue;
+        /// Other predicates - keep them
+        new_predicates.emplace_back(std::move(predicate));
+    }
 
-        if (lhs.fromRight() && rhs.fromLeft())
-            std::swap(lhs, rhs);
-        else if (!lhs.fromLeft() || !rhs.fromRight())
-            continue;
-
-        predicateOperandsToCommonType(lhs, rhs, planning_context);
-        bool null_safe_comparison = JoinConditionOperator::NullSafeEquals == predicate_op;
-        if (null_safe_comparison && isNullableOrLowCardinalityNullable(lhs.getType()) && isNullableOrLowCardinalityNullable(rhs.getType()))
+    /// After loop: if first_has_ref is still set, use it as array join key
+    if (first_has_ref.has_value)
+    {
+        if (first_has_ref.left_is_array)
         {
-            /**
-                * In case of null-safe comparison (a IS NOT DISTINCT FROM b),
-                * we need to wrap keys with a non-nullable type.
-                * The type `tuple` can be used for this purpose,
-                * because value tuple(NULL) is not NULL itself (moreover it has type Tuple(Nullable(T) which is not Nullable).
-                * Thus, join algorithm will match keys with values tuple(NULL).
-                * Example:
-                *   SELECT * FROM t1 JOIN t2 ON t1.a <=> t2.b
-                * This will be semantically transformed to:
-                *   SELECT * FROM t1 JOIN t2 ON tuple(t1.a) == tuple(t2.b)
-                */
-
-            JoinActionRef::AddFunction wrap_nullsafe_function(std::make_shared<FunctionTuple>());
-            lhs = JoinActionRef::transform({lhs}, wrap_nullsafe_function);
-            rhs = JoinActionRef::transform({rhs}, wrap_nullsafe_function);
+            /// has(left_array, right_scalar) - left is array
+            predicateOperandsToCommonTypeForArrayJoin(first_has_ref.lhs, first_has_ref.rhs, planning_context);
+            has_join_predicates = true;
+            table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), true);
+            used_expressions.push_back(first_has_ref.lhs);
+            used_expressions.push_back(first_has_ref.rhs);
         }
-
-        has_join_predicates = true;
-        // std::cerr << "Adding key " << lhs.getColumnName() << ' ' << rhs.getColumnName() << std::endl;
-        table_join_clause.addKey(lhs.getColumnName(), rhs.getColumnName(), null_safe_comparison);
-
-        /// We applied predicate, do not add it to residual conditions
-        used_expressions.push_back(lhs);
-        used_expressions.push_back(rhs);
-        new_predicates.pop_back();
+        else
+        {
+            /// has(right_array, left_scalar) - right is array
+            predicateOperandsToCommonTypeForArrayJoin(first_has_ref.rhs, first_has_ref.lhs, planning_context);
+            has_join_predicates = true;
+            table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), false);
+            used_expressions.push_back(first_has_ref.lhs);
+            used_expressions.push_back(first_has_ref.rhs);
+        }
     }
 
     predicates = std::move(new_predicates);
