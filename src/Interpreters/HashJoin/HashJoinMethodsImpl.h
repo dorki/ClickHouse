@@ -31,15 +31,23 @@ namespace
             return -1;
 
         const auto & clause = clauses[0];  /// For now, only support single clause
+        std::cerr << "[BUILD] Searching for array key among " << key_columns.size() << " key columns" << std::endl;
         for (size_t i = 0; i < key_columns.size(); ++i)
         {
+            std::cerr << "[BUILD] Key " << i << ": isArrayJoinKey=" << clause.isArrayJoinKey(i)
+                      << ", rightIsArray=" << clause.rightIsArray(i)
+                      << ", column type=" << key_columns[i]->getName() << std::endl;
             if (clause.isArrayJoinKey(i))
             {
                 /// Check if this is the array side (right side for build phase)
                 if (clause.rightIsArray(i))
+                {
+                    std::cerr << "[BUILD] Found array key at index " << i << std::endl;
                     return static_cast<ssize_t>(i);
+                }
             }
         }
+        std::cerr << "[BUILD] No array key found" << std::endl;
         return -1;
     }
 }
@@ -242,9 +250,12 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
             size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
             size_t array_end = offsets[ind];
 
+            std::cerr << "[BUILD] Row " << ind << ": Array has " << (array_end - array_start) << " elements" << std::endl;
+
             /// For each element in the array, insert a hash table entry with the element value
             /// All entries point to the same row (ind) in stored_columns
             const IColumn & array_data = array_column->getData();
+            std::cerr << "[BUILD] Array data column type: " << array_data.getName() << std::endl;
 
             /// Create temporary key columns with array data column substituted
             ColumnRawPtrs expanded_key_columns = key_columns;
@@ -261,6 +272,22 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
             {
                 /// Extract key from array element position elem_idx
                 auto emplace_result = elem_key_getter.emplaceKey(map, elem_idx, pool);
+
+                /// Compute hash for logging
+                size_t hash_value = elem_key_getter.getHash(map, elem_idx, pool);
+
+                if (elem_idx == array_start)
+                {
+                    std::cerr << "[BUILD] First element at idx " << elem_idx << std::endl;
+                    std::cerr << "[BUILD] Element value: " << array_data[elem_idx].dump() << std::endl;
+                    std::cerr << "[BUILD] Hash value: " << hash_value << std::endl;
+                }
+                else if (elem_idx == array_start + 1)
+                {
+                    std::cerr << "[BUILD] Second element at idx " << elem_idx << std::endl;
+                    std::cerr << "[BUILD] Element value: " << array_data[elem_idx].dump() << std::endl;
+                    std::cerr << "[BUILD] Hash value: " << hash_value << std::endl;
+                }
 
                 /// Store reference to original row (ind), not the element position
                 if constexpr (is_asof_join)
@@ -601,6 +628,16 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
 
             using FindResult = typename KeyGetter::FindResult;
             auto find_result = row_acceptable ? key_getter.findKey(*map, ind, pool) : FindResult();
+
+            /// Log hash value for first few probes
+            if (ind < 3)
+            {
+                size_t hash_value = key_getter.getHash(*map, ind, pool);
+                std::cerr << "[PROBE] Row " << ind << ": hash=" << hash_value;
+                if (join_keys.key_columns.size() > 0 && join_keys.key_columns[0])
+                    std::cerr << ", value=" << (*join_keys.key_columns[0])[ind].dump();
+                std::cerr << ", found=" << find_result.isFound() << std::endl;
+            }
 
             if (find_result.isFound())
             {

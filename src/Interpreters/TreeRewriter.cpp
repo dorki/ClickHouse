@@ -717,13 +717,15 @@ void collectJoinedColumns(TableJoin & analyzed_join, ASTTableJoin & table_join,
         {
             analyzed_join.addDisjunct();
             CollectJoinOnKeysVisitor(data).visit(table_join.on_expression);
-            assert(analyzed_join.oneDisjunct());
-        }
 
-        /// After visitor finishes: if first_has_ref is still set, process it as array join key
-        if (data.first_has_ref.has_value)
-        {
-            data.addArrayJoinKeys(data.first_has_ref.array_ast, data.first_has_ref.element_ast, data.first_has_ref.table_pos);
+            /// After visitor finishes: if first_has_ref is still set, process it as array join key
+            /// This must be done BEFORE the assertion, because saving has() leaves the clause empty
+            if (data.first_has_ref.has_value)
+            {
+                data.addArrayJoinKeys(data.first_has_ref.array_ast, data.first_has_ref.element_ast, data.first_has_ref.table_pos);
+            }
+
+            assert(analyzed_join.oneDisjunct());
         }
 
         auto check_keys_empty = [] (auto e) { return e.key_names_left.empty(); };

@@ -20,6 +20,28 @@ JoinOnKeyColumns::JoinOnKeyColumns(
     , join_mask_column(JoinCommon::getColumnAsMask(block.getSourceBlock(), cond_column_name))
     , key_sizes(key_sizes_)
 {
+    std::cerr << "[PROBE] Looking up " << key_names.size() << " key columns from left block" << std::endl;
+    const auto & src_block = block.getSourceBlock();
+    std::cerr << "[PROBE] Left block has " << src_block.columns() << " columns:" << std::endl;
+    for (size_t i = 0; i < src_block.columns(); ++i)
+    {
+        const auto & col = src_block.getByPosition(i);
+        std::cerr << "[PROBE]   Column " << i << ": name='" << col.name << "', type=" << col.type->getName() << std::endl;
+    }
+    for (size_t i = 0; i < key_names.size(); ++i)
+    {
+        std::cerr << "[PROBE] Key " << i << ": looking for name='" << key_names[i] << "'" << std::endl;
+        if (i < key_columns.size() && key_columns[i])
+        {
+            std::cerr << "[PROBE] Key " << i << ": found, column type=" << key_columns[i]->getName() << ", rows=" << key_columns[i]->size() << std::endl;
+            if (key_columns[i]->size() > 0)
+                std::cerr << "[PROBE] Key " << i << ": first value=" << (*key_columns[i])[0].dump() << std::endl;
+        }
+        else
+        {
+            std::cerr << "[PROBE] Key " << i << ": NOT FOUND!" << std::endl;
+        }
+    }
 }
 
 void LazyOutput::buildOutput(size_t size_to_reserve, MutableColumns & columns, const UInt64 * row_refs_begin, const UInt64 * row_refs_end) const
