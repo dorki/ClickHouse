@@ -9,6 +9,7 @@
 #include <Core/Joins.h>
 #include <Core/Settings.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
 
 #include <Functions/FunctionFactory.h>
@@ -455,53 +456,237 @@ void predicateOperandsToCommonType(JoinActionRef & left_node, JoinActionRef & ri
     }
 }
 
+void predicateOperandsToCommonTypeForArrayJoin(
+    JoinActionRef & array_node,
+    JoinActionRef & scalar_node,
+    const JoinPlanningContext & planning_context)
+{
+    /// Extract element type from Array(T)
+    const auto * array_type = typeid_cast<const DataTypeArray *>(array_node.getType().get());
+    if (!array_type)
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Array join key '{}' should have Array type but has type {}",
+            array_node.getColumnName(),
+            array_node.getType()->getName());
+    }
+
+    const auto & element_type = array_type->getNestedType();
+    const auto & scalar_type = scalar_node.getType();
+
+    /// If types already match, no casting needed
+    if (element_type->equals(*scalar_type))
+        return;
+
+    /// Find common type between array element type and scalar type
+    DataTypePtr common_type;
+    try
+    {
+        common_type = getLeastSupertype(DataTypes{element_type, scalar_type});
+    }
+    catch (Exception & ex)
+    {
+        ex.addMessage("JOIN cannot infer common type in ON section for array join keys. Array '{}' element type {}. Scalar key '{}' type {}",
+            array_node.getColumnName(), element_type->getName(),
+            scalar_node.getColumnName(), scalar_type->getName());
+        throw;
+    }
+
+    auto cast_transform = [&common_type, &planning_context](auto & dag, auto && nodes)
+    {
+        auto arg = nodes.at(0);
+        auto mapped_it = planning_context.actions_after_join_map.find(arg->result_name);
+        if (mapped_it != planning_context.actions_after_join_map.end() && mapped_it->second->result_type->equals(*common_type))
+            return mapped_it->second;
+        return &dag.addCast(*arg, common_type, {});
+    };
+
+    /// Cast array to Array(common_type) if element type differs
+    if (!element_type->equals(*common_type))
+    {
+        auto target_array_type = std::make_shared<DataTypeArray>(common_type);
+        array_node = JoinActionRef::transform({array_node},
+            [&target_array_type, &planning_context](auto & dag, auto && nodes)
+            {
+                auto arg = nodes.at(0);
+                auto mapped_it = planning_context.actions_after_join_map.find(arg->result_name);
+                if (mapped_it != planning_context.actions_after_join_map.end() && mapped_it->second->result_type->equals(*target_array_type))
+                    return mapped_it->second;
+                return &dag.addCast(*arg, target_array_type, {});
+            });
+    }
+
+    /// Cast scalar to common_type if needed
+    if (!scalar_type->equals(*common_type))
+        scalar_node = JoinActionRef::transform({scalar_node}, cast_transform);
+}
+
 bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, TableJoin::JoinOnClause & table_join_clause,
     std::vector<JoinActionRef> & used_expressions, const JoinPlanningContext & planning_context)
 {
     bool has_join_predicates = false;
     std::vector<JoinActionRef> new_predicates;
 
+    /// Track first has() predicate that might be used as array join key
+    struct FirstHasInfo
+    {
+        JoinActionRef predicate = nullptr;
+        JoinActionRef lhs = nullptr;
+        JoinActionRef rhs = nullptr;
+        bool left_is_array = false;
+        bool has_value = false;
+    };
+    FirstHasInfo first_has_ref;
+
+    std::cerr << "[DEBUG] Starting loop with predicates.size()=" << predicates.size() << "\n";
+    for (size_t i = 0; i < predicates.size(); ++i)
+    {
+        std::cerr << "[DEBUG] predicates[" << i << "]=" << predicates[i].dump() << "\n";
+    }
+
     for (auto & pred : predicates)
     {
-        auto & predicate = new_predicates.emplace_back(std::move(pred));
-        auto [predicate_op, lhs, rhs] = predicate.asBinaryPredicate();
-        if (predicate_op != JoinConditionOperator::Equals && predicate_op != JoinConditionOperator::NullSafeEquals)
-            continue;
+        JoinActionRef predicate = std::move(pred);
+        std::cerr << "[DEBUG] Processing predicate: " << predicate.dump() << "\n";
 
-        if (lhs.fromRight() && rhs.fromLeft())
-            std::swap(lhs, rhs);
-        else if (!lhs.fromLeft() || !rhs.fromRight())
-            continue;
-
-        predicateOperandsToCommonType(lhs, rhs, planning_context);
-        bool null_safe_comparison = JoinConditionOperator::NullSafeEquals == predicate_op;
-        if (null_safe_comparison && isNullableOrLowCardinalityNullable(lhs.getType()) && isNullableOrLowCardinalityNullable(rhs.getType()))
+        /// First, check for equality conditions - these take priority
+        auto [predicate_op, eq_lhs, eq_rhs] = predicate.asBinaryPredicate();
+        if (predicate_op == JoinConditionOperator::Equals || predicate_op == JoinConditionOperator::NullSafeEquals)
         {
-            /**
-                * In case of null-safe comparison (a IS NOT DISTINCT FROM b),
-                * we need to wrap keys with a non-nullable type.
-                * The type `tuple` can be used for this purpose,
-                * because value tuple(NULL) is not NULL itself (moreover it has type Tuple(Nullable(T) which is not Nullable).
-                * Thus, join algorithm will match keys with values tuple(NULL).
-                * Example:
-                *   SELECT * FROM t1 JOIN t2 ON t1.a <=> t2.b
-                * This will be semantically transformed to:
-                *   SELECT * FROM t1 JOIN t2 ON tuple(t1.a) == tuple(t2.b)
-                */
+            if (eq_lhs.fromRight() && eq_rhs.fromLeft())
+                std::swap(eq_lhs, eq_rhs);
 
-            JoinActionRef::AddFunction wrap_nullsafe_function(std::make_shared<FunctionTuple>());
-            lhs = JoinActionRef::transform({lhs}, wrap_nullsafe_function);
-            rhs = JoinActionRef::transform({rhs}, wrap_nullsafe_function);
+            if (eq_lhs.fromLeft() && eq_rhs.fromRight())
+            {
+                /// Found an equality condition - add as join key
+                predicateOperandsToCommonType(eq_lhs, eq_rhs, planning_context);
+                bool null_safe_comparison = JoinConditionOperator::NullSafeEquals == predicate_op;
+                if (null_safe_comparison && isNullableOrLowCardinalityNullable(eq_lhs.getType()) && isNullableOrLowCardinalityNullable(eq_rhs.getType()))
+                {
+                    /**
+                        * In case of null-safe comparison (a IS NOT DISTINCT FROM b),
+                        * we need to wrap keys with a non-nullable type.
+                        * The type `tuple` can be used for this purpose,
+                        * because value tuple(NULL) is not NULL itself (moreover it has type Tuple(Nullable(T) which is not Nullable).
+                        * Thus, join algorithm will match keys with values tuple(NULL).
+                        * Example:
+                        *   SELECT * FROM t1 JOIN t2 ON t1.a <=> t2.b
+                        * This will be semantically transformed to:
+                        *   SELECT * FROM t1 JOIN t2 ON tuple(t1.a) == tuple(t2.b)
+                        */
+
+                    JoinActionRef::AddFunction wrap_nullsafe_function(std::make_shared<FunctionTuple>());
+                    eq_lhs = JoinActionRef::transform({eq_lhs}, wrap_nullsafe_function);
+                    eq_rhs = JoinActionRef::transform({eq_rhs}, wrap_nullsafe_function);
+                }
+
+                has_join_predicates = true;
+                // std::cerr << "Adding key " << eq_lhs.getColumnName() << ' ' << eq_rhs.getColumnName() << std::endl;
+                table_join_clause.addKey(eq_lhs.getColumnName(), eq_rhs.getColumnName(), null_safe_comparison);
+
+                /// We applied predicate, do not add it to residual conditions
+                used_expressions.push_back(eq_lhs);
+                used_expressions.push_back(eq_rhs);
+
+                /// If we had saved a has() ref, add it to post-filters now since we found an equality
+                if (first_has_ref.has_value)
+                {
+                    new_predicates.emplace_back(std::move(first_has_ref.predicate));
+                    first_has_ref.has_value = false;
+                }
+                continue;
+            }
         }
 
-        has_join_predicates = true;
-        // std::cerr << "Adding key " << lhs.getColumnName() << ' ' << rhs.getColumnName() << std::endl;
-        table_join_clause.addKey(lhs.getColumnName(), rhs.getColumnName(), null_safe_comparison);
+        /// Check for has(array_col, element_col) - array join semantics
+        const auto * node = predicate.getNode();
+        if (node && node->function_base && node->function_base->getName() == "has" && node->children.size() == 2)
+        {
+            /// Get arguments from the has() function's children
+            auto lhs_args = predicate.getArguments();
+            if (lhs_args.size() == 2)
+            {
+                auto lhs = lhs_args[0];
+                auto rhs = lhs_args[1];
 
-        /// We applied predicate, do not add it to residual conditions
-        used_expressions.push_back(lhs);
-        used_expressions.push_back(rhs);
-        new_predicates.pop_back();
+                /// Ensure one arg is from left and one from right
+                if ((lhs.fromLeft() && rhs.fromRight()) || (lhs.fromRight() && rhs.fromLeft()))
+                {
+                    if (lhs.fromRight() && rhs.fromLeft())
+                        std::swap(lhs, rhs);
+
+                    /// Determine which side is the array
+                    bool left_is_array = typeid_cast<const DataTypeArray *>(lhs.getType().get()) != nullptr;
+                    bool right_is_array = typeid_cast<const DataTypeArray *>(rhs.getType().get()) != nullptr;
+
+                    if ((left_is_array && !right_is_array) || (right_is_array && !left_is_array))
+                    {
+                        /// Check if this is the first has() and no keys added yet
+                        if (!first_has_ref.has_value && table_join_clause.key_names_left.empty())
+                        {
+                            /// Save this as potential array join key
+                            first_has_ref.predicate = predicate;
+                            first_has_ref.lhs = lhs;
+                            first_has_ref.rhs = rhs;
+                            first_has_ref.left_is_array = left_is_array;
+                            first_has_ref.has_value = true;
+                            /// Don't add to new_predicates yet
+                            continue;
+                        }
+                        else
+                        {
+                            /// Either not first has(), or keys already exist
+                            /// Add as post-filter
+                            new_predicates.emplace_back(std::move(predicate));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Other predicates - keep them
+        new_predicates.emplace_back(std::move(predicate));
+    }
+
+    /// After loop: if first_has_ref is still set, use it as array join key
+    if (first_has_ref.has_value)
+    {
+        std::cerr << "[DEBUG] Processing saved has() at end of loop\n";
+        std::cerr << "[DEBUG] left_is_array=" << first_has_ref.left_is_array << "\n";
+        std::cerr << "[DEBUG] lhs column=" << first_has_ref.lhs.getColumnName() << " fromLeft=" << first_has_ref.lhs.fromLeft() << " fromRight=" << first_has_ref.lhs.fromRight() << "\n";
+        std::cerr << "[DEBUG] rhs column=" << first_has_ref.rhs.getColumnName() << " fromLeft=" << first_has_ref.rhs.fromLeft() << " fromRight=" << first_has_ref.rhs.fromRight() << "\n";
+
+        if (first_has_ref.left_is_array)
+        {
+            /// has(left_array, right_scalar) - left is array
+            std::cerr << "[DEBUG] BEFORE conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
+            predicateOperandsToCommonTypeForArrayJoin(first_has_ref.lhs, first_has_ref.rhs, planning_context);
+            std::cerr << "[DEBUG] AFTER conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
+            std::cerr << "[DEBUG] Adding array join key: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << " left_is_array=true\n";
+            has_join_predicates = true;
+            table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), true);
+            used_expressions.push_back(first_has_ref.lhs);
+            used_expressions.push_back(first_has_ref.rhs);
+        }
+        else
+        {
+            /// has(right_array, left_scalar) - right is array
+            std::cerr << "[DEBUG] BEFORE conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
+            predicateOperandsToCommonTypeForArrayJoin(first_has_ref.rhs, first_has_ref.lhs, planning_context);
+            std::cerr << "[DEBUG] AFTER conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
+            std::cerr << "[DEBUG] Adding array join key: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << " left_is_array=false\n";
+            has_join_predicates = true;
+            table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), false);
+            used_expressions.push_back(first_has_ref.lhs);
+            used_expressions.push_back(first_has_ref.rhs);
+        }
+    }
+
+    std::cerr << "[DEBUG] new_predicates size=" << new_predicates.size() << "\n";
+    for (size_t i = 0; i < new_predicates.size(); ++i)
+    {
+        std::cerr << "[DEBUG] new_predicates[" << i << "]=" << new_predicates[i].dump() << " fromLeft=" << new_predicates[i].fromLeft() << " fromRight=" << new_predicates[i].fromRight() << "\n";
     }
 
     predicates = std::move(new_predicates);
@@ -902,19 +1087,42 @@ static QueryPlanNode buildPhysicalJoinImpl(
         join_expression.erase(found_asof_predicate_it);
     }
 
+    std::cerr << "[DEBUG] Before extracting pre-filters, join_expression size=" << join_expression.size() << "\n";
+    for (size_t i = 0; i < join_expression.size(); ++i)
+    {
+        std::cerr << "[DEBUG] join_expression[" << i << "]=" << join_expression[i].dump() << " fromLeft=" << join_expression[i].fromLeft() << " fromRight=" << join_expression[i].fromRight() << "\n";
+    }
+
     if (auto left_pre_filter_condition = concatConditions(join_expression, JoinTableSide::Left))
     {
+        std::cerr << "[DEBUG] Extracted left pre-filter: " << left_pre_filter_condition.getColumnName() << "\n";
         table_join_clauses.at(table_join_clauses.size() - 1).analyzer_left_filter_condition_column_name = left_pre_filter_condition.getColumnName();
         used_expressions.push_back(left_pre_filter_condition);
+    }
+    else
+    {
+        std::cerr << "[DEBUG] No left pre-filter extracted\n";
     }
 
     if (auto right_pre_filter_condition = concatConditions(join_expression, JoinTableSide::Right))
     {
+        std::cerr << "[DEBUG] Extracted right pre-filter: " << right_pre_filter_condition.getColumnName() << "\n";
         table_join_clauses.at(table_join_clauses.size() - 1).analyzer_right_filter_condition_column_name = right_pre_filter_condition.getColumnName();
         used_expressions.push_back(right_pre_filter_condition);
     }
+    else
+    {
+        std::cerr << "[DEBUG] No right pre-filter extracted\n";
+    }
+
+    std::cerr << "[DEBUG] After extracting pre-filters, join_expression size=" << join_expression.size() << "\n";
+    for (size_t i = 0; i < join_expression.size(); ++i)
+    {
+        std::cerr << "[DEBUG] Remaining join_expression[" << i << "]=" << join_expression[i].dump() << "\n";
+    }
 
     join_operator.residual_filter.append_range(join_expression);
+    std::cerr << "[DEBUG] residual_filter size=" << join_operator.residual_filter.size() << "\n";
     JoinActionRef residual_filter_condition = concatConditions(join_operator.residual_filter);
     std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> actions_after_join_fold;
     for (const auto * action : actions_after_join)

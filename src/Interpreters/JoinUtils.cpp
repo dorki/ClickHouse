@@ -6,6 +6,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/FilterDescription.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -389,7 +390,8 @@ ColumnRawPtrs extractKeysForJoin(const Block & block_keys, const Names & key_nam
 }
 
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
-                      const Block & block_right, const Names & key_names_right)
+                      const Block & block_right, const Names & key_names_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes)
 {
     size_t keys_size = key_names_left.size();
 
@@ -397,6 +399,28 @@ void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
     {
         DataTypePtr left_type = removeNullable(recursiveRemoveLowCardinality(block_left.getByName(key_names_left[i]).type));
         DataTypePtr right_type = removeNullable(recursiveRemoveLowCardinality(block_right.getByName(key_names_right[i]).type));
+
+        /// For array join keys, extract element type from array side for comparison
+        if (array_join_key_indexes && array_join_key_indexes->contains(i))
+        {
+            auto it = array_join_key_indexes->find(i);
+            bool left_is_array = it->second;
+
+            if (left_is_array)
+            {
+                /// Left is array, extract element type
+                const auto * array_type = typeid_cast<const DataTypeArray *>(left_type.get());
+                if (array_type)
+                    left_type = removeNullable(recursiveRemoveLowCardinality(array_type->getNestedType()));
+            }
+            else
+            {
+                /// Right is array, extract element type
+                const auto * array_type = typeid_cast<const DataTypeArray *>(right_type.get());
+                if (array_type)
+                    right_type = removeNullable(recursiveRemoveLowCardinality(array_type->getNestedType()));
+            }
+        }
 
         if (!left_type->equals(*right_type))
         {
@@ -410,9 +434,10 @@ void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
 }
 
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left, const String & condition_name_left,
-                      const Block & block_right, const Names & key_names_right, const String & condition_name_right)
+                      const Block & block_right, const Names & key_names_right, const String & condition_name_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes)
 {
-    checkTypesOfKeys(block_left, key_names_left, block_right, key_names_right);
+    checkTypesOfKeys(block_left, key_names_left, block_right, key_names_right, array_join_key_indexes);
     checkTypesOfMasks(block_left, condition_name_left, block_right, condition_name_right);
 }
 

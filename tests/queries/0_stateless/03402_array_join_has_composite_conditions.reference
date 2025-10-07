@@ -1,0 +1,24 @@
+=== Test 1: has() only ===
+1	A
+2	A
+2	B
+3	A
+3	B
+Type: INNER
+Type: INNER
+1	X	cat1
+2	Y	cat2
+3	Z	cat1
+Type: INNER
+1	A	Group1
+2	B	Group1
+2	B	Group2
+3	C	Group2
+1	First
+2	Second
+3	Third
+1	X	cat1
+2	Y	cat2
+3	Z	cat1
+1	WithNull
+2	WithNull

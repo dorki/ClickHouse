@@ -1112,7 +1112,7 @@ void HashJoin::checkTypesOfKeys(const Block & block) const
 {
     for (const auto & onexpr : table_join->getClauses())
     {
-        JoinCommon::checkTypesOfKeys(block, onexpr.key_names_left, right_table_keys, onexpr.key_names_right);
+        JoinCommon::checkTypesOfKeys(block, onexpr.key_names_left, right_table_keys, onexpr.key_names_right, &onexpr.array_join_key_indexes);
     }
 }
 
@@ -1125,7 +1125,7 @@ JoinResultPtr HashJoin::joinBlock(Block block)
     {
         auto cond_column_name = onexpr.condColumnNames();
         JoinCommon::checkTypesOfKeys(
-            block, onexpr.key_names_left, cond_column_name.first, right_sample_block, onexpr.key_names_right, cond_column_name.second);
+            block, onexpr.key_names_left, cond_column_name.first, right_sample_block, onexpr.key_names_right, cond_column_name.second, &onexpr.array_join_key_indexes);
     }
 
     if (kind == JoinKind::Cross || kind == JoinKind::Comma)
@@ -1193,7 +1193,8 @@ JoinResultPtr HashJoin::joinScatteredBlock(ScatteredBlock block)
             cond_column_name.first,
             right_sample_block,
             onexpr.key_names_right,
-            cond_column_name.second);
+            cond_column_name.second,
+            &onexpr.array_join_key_indexes);
     }
 
     std::vector<const std::decay_t<decltype(data->maps[0])> *> maps_vector;

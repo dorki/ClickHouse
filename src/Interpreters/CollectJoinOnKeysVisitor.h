@@ -54,9 +54,21 @@ public:
         ASTPtr asof_left_key{};
         ASTPtr asof_right_key{};
 
+        /// Track first has() predicate for single-pass algorithm
+        struct FirstHasInfo
+        {
+            ASTPtr original_ast;  /// The original has() function AST
+            ASTPtr array_ast;
+            ASTPtr element_ast;
+            JoinIdentifierPosPair table_pos;
+            bool has_value = false;
+        };
+        FirstHasInfo first_has_ref;
+
         void addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, JoinIdentifierPosPair table_pos, bool null_safe_comparison);
         void addAsofJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, JoinIdentifierPosPair table_pos,
                              const ASOFJoinInequality & asof_inequality);
+        void addArrayJoinKeys(const ASTPtr & array_ast, const ASTPtr & element_ast, JoinIdentifierPosPair table_pos);
         void asofToJoinKeys();
     };
 

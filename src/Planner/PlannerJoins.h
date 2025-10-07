@@ -79,6 +79,32 @@ public:
         asof_conditions.push_back(ASOFCondition{left_key_nodes.size() - 1, asof_inequality});
     }
 
+    /// Add array join key (has(array_col, element_col))
+    void addArrayJoinKey(const ActionsDAG::Node * left_key_node, const ActionsDAG::Node * right_key_node, bool left_is_array)
+    {
+        size_t key_index = left_key_nodes.size();
+        left_key_nodes.emplace_back(left_key_node);
+        right_key_nodes.emplace_back(right_key_node);
+        array_join_key_indexes[key_index] = left_is_array;
+    }
+
+    bool isArrayJoinKey(size_t key_index) const
+    {
+        return array_join_key_indexes.contains(key_index);
+    }
+
+    bool leftIsArray(size_t key_index) const
+    {
+        auto it = array_join_key_indexes.find(key_index);
+        return it != array_join_key_indexes.end() && it->second;
+    }
+
+    bool rightIsArray(size_t key_index) const
+    {
+        auto it = array_join_key_indexes.find(key_index);
+        return it != array_join_key_indexes.end() && !it->second;
+    }
+
     /// Add condition for table side
     void addCondition(JoinTableSide table_side, const ActionsDAG::Node * condition_node)
     {
@@ -200,6 +226,10 @@ private:
     ActionsDAG::NodeRawConstPtrs residual_filter_condition_nodes;
 
     std::unordered_set<size_t> nullsafe_compare_key_indexes;
+
+    /// Track which keys use array join semantics (has(array_col, element_col))
+    /// For key at index i: true = left is array, false = right is array
+    std::unordered_map<size_t, bool> array_join_key_indexes;
 };
 
 using JoinClauses = std::vector<JoinClause>;

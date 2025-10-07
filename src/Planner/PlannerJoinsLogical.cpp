@@ -6,6 +6,7 @@
 #include <IO/Operators.h>
 #include <IO/WriteBufferFromString.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 
