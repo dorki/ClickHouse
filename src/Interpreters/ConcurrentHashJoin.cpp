@@ -34,6 +34,7 @@
 
 #include <Interpreters/HashJoin/HashJoin.h>
 #include <Interpreters/HashJoin/KeyGetter.h>
+#include <Interpreters/HashJoin/ArrayJoinDispatch.h>
 #include <DataTypes/NullableUtils.h>
 #include <base/defines.h>
 #include <base/types.h>
@@ -443,7 +444,7 @@ BlockHashes calculateHashes(const HashTable & hash_table, const ColumnRawPtrs & 
     return hash;
 }
 
-IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_shards, const Strings & key_columns_names, const Block & from_block)
+ArrayJoinDispatch::SelectorWithMapping selectDispatchBlockWithMapping(const HashJoin & join, size_t num_shards, const Strings & key_columns_names, const Block & from_block)
 {
     std::vector<ColumnPtr> key_column_holders;
     ColumnRawPtrs key_columns;
@@ -458,50 +459,27 @@ IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_shards, 
     ConstNullMapPtr null_map{};
     ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(key_columns, null_map);
 
-    /// Check if we have array join keys
-    const auto & clauses = join.getTableJoin().getClauses();
-    chassert(!clauses.empty(), "Expected at least one join clause");
-    const auto & clause = clauses[0];
-
-    size_t array_key_index = -1;
-    for (size_t i = 0; i < key_columns.size(); ++i)
+    /// Create hash function that returns the shard/slot number (not raw hash)
+    /// This ensures consistency with the bucket calculation during build phase
+    auto hash_func = [&join, num_shards](const ColumnRawPtrs & cols, size_t row_idx) -> size_t
     {
-        if (clause.isArrayJoinKey(i) && clause.rightIsArray(i))
+        Arena pool;
+
+        /// Calculate hash and convert to shard using the same logic as hashToSelector
+        auto calculate_shard = [&](auto & maps) -> size_t
         {
-            array_key_index = i;
-            break;
-        }
-    }
-
-    /// If we have array join keys, we need special handling for dispatch
-    if (array_key_index != static_cast<size_t>(-1))
-    {
-        std::cerr << "[DISPATCH] Array join key detected at index " << array_key_index << std::endl;
-
-        const auto * array_column = typeid_cast<const ColumnArray *>(key_columns[array_key_index]);
-        const auto & offsets = array_column->getOffsets();
-        const IColumn & array_data = array_column->getData();
-
-        /// Extract nested column from nullable arrays
-        const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
-        const IColumn * element_column = nullable_array_data ? &nullable_array_data->getNestedColumn() : &array_data;
-        const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
-
-        /// Substitute element column for array column
-        ColumnRawPtrs expanded_key_columns = key_columns;
-        expanded_key_columns[array_key_index] = element_column;
-
-        /// Calculate selector for elements (same as original, just with expanded columns)
-        auto calculate_element_selector = [&](auto & maps)
-        {
-            BlockHashes hash;
             switch (join.getJoinedData()->type)
             {
             #define M(TYPE) \
-                case HashJoin::Type::TYPE: \
-                    hash = calculateHashes<typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                        *maps.TYPE, expanded_key_columns, join.getKeySizes().at(0)); \
-                    return hashToSelector(*maps.TYPE, hash, num_shards);
+                case HashJoin::Type::TYPE: { \
+                    auto key_getter = typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type( \
+                        cols, join.getKeySizes().at(0), nullptr); \
+                    size_t hash = key_getter.getHash(*maps.TYPE, row_idx, pool); \
+                    if constexpr (HasGetBucketFromHashMemberFunc<std::remove_reference_t<decltype(*maps.TYPE)>>) \
+                        return maps.TYPE->getBucketFromHash(hash) & (num_shards - 1); \
+                    else \
+                        return hash & (num_shards - 1); \
+                }
                     APPLY_FOR_JOIN_VARIANTS(M)
             #undef M
                 default:
@@ -509,79 +487,90 @@ IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_shards, 
             }
         };
 
-        IColumn::Selector element_selector = std::visit(calculate_element_selector, join.getJoinedData()->maps.at(0));
-
-        /// Build row selector: duplicate rows for slots with multiple elements
-        const size_t num_rows = from_block.rows();
-        IColumn::Selector selector;
-        selector.reserve(num_rows); // At least one entry per row
-
-        for (size_t row = 0; row < num_rows; ++row)
-        {
-            size_t array_start = row == 0 ? 0 : offsets[row - 1];
-            size_t array_end = offsets[row];
-
-            /// Collect unique slots for this row's non-NULL elements
-            std::set<size_t> slots_for_row;
-            for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
-            {
-                if (element_null_map && (*element_null_map)[elem_idx])
-                    continue;
-                slots_for_row.insert(element_selector[elem_idx]);
-            }
-
-            if (slots_for_row.empty())
-            {
-                /// All NULL - send to slot 0 (will be filtered during build)
-                selector.push_back(0);
-                std::cerr << "[DISPATCH] Row " << row << " → slot 0 (all NULL)" << std::endl;
-            }
-            else
-            {
-                /// Add one selector entry per slot (duplicates the row)
-                for (size_t slot : slots_for_row)
-                {
-                    selector.push_back(slot);
-                    std::cerr << "[DISPATCH] Row " << row << " → slot " << slot << std::endl;
-                }
-            }
-        }
-
-        return selector;
-    }
-
-    auto calculate_selector = [&](auto & maps)
-    {
-        BlockHashes hash;
-
-        switch (join.getJoinedData()->type)
-        {
-        #define M(TYPE)                                                                                                                       \
-            case HashJoin::Type::TYPE:                                                                                                        \
-                hash = calculateHashes<typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                    *maps.TYPE, key_columns, join.getKeySizes().at(0));                                                                       \
-                return hashToSelector(*maps.TYPE, hash, num_shards);
-
-                APPLY_FOR_JOIN_VARIANTS(M)
-        #undef M
-
-            default:
-                UNREACHABLE();
-        }
+        /// CHJ supports only one join clause for now
+        chassert(join.getJoinedData()->maps.size() == 1, "Expected to have only one join clause");
+        return std::visit(calculate_shard, join.getJoinedData()->maps.at(0));
     };
 
-    /// CHJ supports only one join clause for now
-    chassert(join.getJoinedData()->maps.size() == 1, "Expected to have only one join clause");
+    /// Determine which side we're dispatching (based on key_columns_names)
+    /// For ConcurrentHashJoin, we dispatch right side during build, left side during probe
+    /// We check the first key name against the join clauses to determine the side
+    JoinTableSide side = JoinTableSide::Right; // Default to right (build phase)
+    const auto & clauses = join.getTableJoin().getClauses();
+    if (!clauses.empty() && !key_columns_names.empty())
+    {
+        const auto & first_key = key_columns_names[0];
+        if (std::find(clauses[0].key_names_left.begin(), clauses[0].key_names_left.end(), first_key)
+            != clauses[0].key_names_left.end())
+        {
+            side = JoinTableSide::Left;
+        }
+    }
 
-    return std::visit([&](auto & maps) { return calculate_selector(maps); }, join.getJoinedData()->maps.at(0));
+    /// Use the shared array-aware selector creation with mapping
+    return ArrayJoinDispatch::createArrayAwareSelectorWithMapping(
+        from_block,
+        key_columns_names,
+        join.getTableJoin(),
+        side,
+        num_shards,
+        hash_func);
 }
 
-ScatteredBlocks scatterBlocksByCopying(size_t num_shards, const IColumn::Selector & selector, const Block & from_block)
+/// Backward-compatible wrapper
+IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_shards, const Strings & key_columns_names, const Block & from_block)
+{
+    return selectDispatchBlockWithMapping(join, num_shards, key_columns_names, from_block).selector;
+}
+
+ScatteredBlocks scatterBlocksByCopying(
+    size_t num_shards,
+    const IColumn::Selector & selector,
+    const Block & from_block,
+    const std::vector<size_t> * source_row_mapping = nullptr)
 {
     Blocks blocks(num_shards);
     for (size_t i = 0; i < num_shards; ++i)
         blocks[i] = from_block.cloneEmpty();
 
+    /// Check if selector has duplicates (array join case)
+    /// In this case, selector.size() > from_block.rows() and we need source_row_mapping
+    if (selector.size() > from_block.rows())
+    {
+        chassert(source_row_mapping != nullptr && "Source row mapping required for array joins");
+        chassert(source_row_mapping->size() == selector.size() && "Mapping size must match selector size");
+
+        /// Array join case: manually copy rows using the source row mapping
+        for (size_t col_idx = 0; col_idx < from_block.columns(); ++col_idx)
+        {
+            const auto & source_column = from_block.getByPosition(col_idx).column;
+
+            /// For each shard, build the output column
+            std::vector<MutableColumnPtr> shard_columns(num_shards);
+            for (size_t shard = 0; shard < num_shards; ++shard)
+                shard_columns[shard] = source_column->cloneEmpty();
+
+            /// Iterate through selector and copy rows
+            for (size_t selector_idx = 0; selector_idx < selector.size(); ++selector_idx)
+            {
+                size_t shard = selector[selector_idx];
+                size_t source_row = (*source_row_mapping)[selector_idx];
+                shard_columns[shard]->insertFrom(*source_column, source_row);
+            }
+
+            /// Move columns to result blocks
+            for (size_t shard = 0; shard < num_shards; ++shard)
+                blocks[shard].getByPosition(col_idx).column = std::move(shard_columns[shard]);
+        }
+
+        ScatteredBlocks result;
+        result.reserve(num_shards);
+        for (size_t i = 0; i < num_shards; ++i)
+            result.emplace_back(std::move(blocks[i]));
+        return result;
+    }
+
+    /// Standard case: selector.size() == from_block.rows(), use IColumn::scatter
     for (size_t i = 0; i < from_block.columns(); ++i)
     {
         auto dispatched_columns = from_block.getByPosition(i).column->scatter(num_shards, selector);
@@ -629,7 +618,24 @@ ScatteredBlocks ConcurrentHashJoin::dispatchBlock(const Strings & key_columns_na
         return res;
     }
 
-    IColumn::Selector selector = selectDispatchBlock(*hash_joins[0]->data, num_shards, key_columns_names, from_block);
+    /// Get selector with source row mapping for array joins
+    ArrayJoinDispatch::SelectorWithMapping selector_with_mapping =
+        selectDispatchBlockWithMapping(*hash_joins[0]->data, num_shards, key_columns_names, from_block);
+
+    /// Check if we have array join keys - if so, selector may have duplicates and we must use copying
+    bool has_array_keys = ArrayJoinDispatch::hasArrayJoinKeys(
+        key_columns_names,
+        *table_join,
+        JoinTableSide::Right); // Dispatch is for right side (build)
+
+    /// For array joins, selector may have more entries than block.rows() due to row duplication
+    /// In this case, we MUST use copying with source row mapping, not zero-copy with indices
+    if (has_array_keys || selector_with_mapping.selector.size() != from_block.rows())
+    {
+        return scatterBlocksByCopying(num_shards, selector_with_mapping.selector, from_block, &selector_with_mapping.source_row_mapping);
+    }
+
+    const IColumn::Selector & selector = selector_with_mapping.selector;
 
     /// With zero-copy approach we won't copy the source columns, but will create a new one with indices.
     /// This is not beneficial when the whole set of columns is e.g. a single small column.

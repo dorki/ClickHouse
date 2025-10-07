@@ -118,6 +118,9 @@ Blocks scatterBlockByHash(const Strings & key_columns_names, const Block & block
 Blocks scatterBlockByHash(const Strings & key_columns_names, const Blocks & blocks, size_t num_shards);
 Blocks scatterBlockByHash(const Strings & key_columns_names, const BlocksList & blocks, size_t num_shards);
 
+/// Array-aware variant for joins with array keys
+Blocks scatterBlockByHash(const Strings & key_columns_names, const Block & block, size_t num_shards, const TableJoin & table_join, JoinTableSide side);
+
 bool hasNonJoinedBlocks(const TableJoin & table_join);
 
 /// Insert default values for rows marked in filter

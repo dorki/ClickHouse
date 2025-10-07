@@ -1,0 +1,62 @@
+Test 1: grace_hash (new analyzer)
+863	762
+Test 2: grace_hash (old analyzer)
+863	762
+Test 3: hash (new analyzer)
+863	762
+Test 4: hash (old analyzer)
+863	762
+Test 5: parallel_hash (new analyzer)
+863	762
+Test 6: parallel_hash (old analyzer)
+863	762
+Test 7: Specific cases verification (grace_hash)
+Duplicates	1
+HighIds	3
+MixedNulls	3
+Sequential	5
+Sparse	11
+Test 8: Specific cases verification (parallel_hash)
+Duplicates	1
+HighIds	3
+MixedNulls	3
+Sequential	5
+Sparse	11
+Test 9: Sample matches (grace_hash)
+1	Duplicates
+1	Sequential
+1	Sparse
+1	Value_199
+2	Sequential
+3	Sequential
+3	Value_199
+500	MixedNulls
+500	Sparse
+500	Value_99
+999	HighIds
+999	Value_199
+Test 10: Sample matches (parallel_hash)
+1	Duplicates
+1	Sequential
+1	Sparse
+1	Value_199
+2	Sequential
+3	Sequential
+3	Value_199
+500	MixedNulls
+500	Sparse
+500	Value_99
+999	HighIds
+999	Value_199
+Test 11: Group by category (grace_hash)
+0	116
+1	140
+2	163
+3	201
+4	243
+Test 12: Group by category (parallel_hash)
+0	116
+1	140
+2	163
+3	201
+4	243

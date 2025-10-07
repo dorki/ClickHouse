@@ -302,18 +302,20 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                     continue;
                 }
 
+                /// Calculate hash for this element (needed for filtering)
+                size_t elem_hash = elem_key_getter.getHash(map, elem_idx, pool);
+
                 /// For parallel hash (multiple slots), check bucket ownership
                 /// Only filter if we're using two-level maps (requires both runtime and compile-time checks)
                 if constexpr (HasGetBucketFromHashMemberFunc<HashMap>)
                 {
                     if (total_slots > 1 && join.twoLevelMapIsUsed())
                     {
-                        size_t hash = elem_key_getter.getHash(map, elem_idx, pool);
-                        size_t bucket = map.getBucketFromHash(hash);
+                        size_t bucket = map.getBucketFromHash(elem_hash);
                         size_t slot = bucket & (total_slots - 1);
 
                         std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
-                                  << " hash=" << hash << " bucket=" << bucket << " slot=" << slot << std::endl;
+                                  << " hash=" << elem_hash << " bucket=" << bucket << " slot=" << slot << std::endl;
 
                         if (slot != current_slot_id)
                         {
@@ -344,7 +346,7 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                 std::thread::id this_id = std::this_thread::get_id();
 
                 std::cerr << "[BUILD] Emplaced element, isInserted=" << emplace_result.isInserted()
-                            << ", thread: " << this_id 
+                            << ", thread: " << this_id
                           << ", map.size()=" << map.size() << std::endl;
 
                 /// Store reference to original row (ind), not the element position
@@ -368,9 +370,32 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                 else
                 {
                     if (emplace_result.isInserted())
+                    {
                         new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                    }
                     else
-                        emplace_result.getMapped().insert({stored_columns, ind}, pool);
+                    {
+                        /// Key already exists - only add row reference if this row (ind) isn't already in the list
+                        /// This handles duplicate values within the same array: [1, 1, 1, 1]
+                        auto & existing_rows = emplace_result.getMapped();
+                        bool row_already_added = false;
+
+                        /// Check if row 'ind' is already in the list
+                        for (auto it = existing_rows.begin(); it.ok(); ++it)
+                        {
+                            if (it->row_num == ind)
+                            {
+                                row_already_added = true;
+                                std::cerr << "[BUILD] Skipping duplicate: row " << ind << " already added for this key" << std::endl;
+                                break;
+                            }
+                        }
+
+                        if (!row_already_added)
+                        {
+                            existing_rows.insert({stored_columns, ind}, pool);
+                        }
+                    }
                     /// Don't update all_values_unique here for array joins - we already set it to false
                     all_values_unique &= emplace_result.isInserted();
                 }

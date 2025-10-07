@@ -9,7 +9,28 @@ CREATE TABLE t10 (arr Array(Nullable(UInt32)), value String) ENGINE = Memory;
 INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
 INSERT INTO t10 VALUES ([1, NULL, 2], 'WithNull');
 
-select 'new';
+select 'new grace_hash';
+--explain actions =1 
+SELECT t1.id, t10.value
+FROM t1
+INNER JOIN t10 ON has(t10.arr, t1.id)
+--where t1.id > 0
+ORDER BY t1.id
+SETTINGS enable_analyzer = 1, join_algorithm='grace_hash';
+
+select 'old grace_hash';
+--explain actions =1 
+SELECT t1.id, t10.value
+FROM t1
+INNER JOIN t10 ON has(t10.arr, t1.id)
+--where t1.id > 0
+ORDER BY t1.id
+SETTINGS enable_analyzer = 0, join_algorithm='grace_hash';
+
+
+
+select 'new hash';
+--explain actions =1 
 SELECT t1.id, t10.value
 FROM t1
 INNER JOIN t10 ON has(t10.arr, t1.id)
@@ -17,7 +38,8 @@ INNER JOIN t10 ON has(t10.arr, t1.id)
 ORDER BY t1.id
 SETTINGS enable_analyzer = 1, join_algorithm='hash';
 
-select 'old';
+select 'old hash';
+--explain actions =1 
 SELECT t1.id, t10.value
 FROM t1
 INNER JOIN t10 ON has(t10.arr, t1.id)
@@ -25,4 +47,21 @@ INNER JOIN t10 ON has(t10.arr, t1.id)
 ORDER BY t1.id
 SETTINGS enable_analyzer = 0, join_algorithm='hash';
 
+select 'new parallel_hash';
+--explain actions =1 
+SELECT t1.id, t10.value
+FROM t1
+INNER JOIN t10 ON has(t10.arr, t1.id)
+--where t1.id > 0
+ORDER BY t1.id
+SETTINGS enable_analyzer = 1, join_algorithm='parallel_hash';
+
+select 'old parallel_hash';
+--explain actions =1 
+SELECT t1.id, t10.value
+FROM t1
+INNER JOIN t10 ON has(t10.arr, t1.id)
+--where t1.id > 0
+ORDER BY t1.id
+SETTINGS enable_analyzer = 0, join_algorithm='parallel_hash';
 --- not working end
