@@ -142,7 +142,7 @@ public:
     bool addBlockToJoin(const Block & source_block_, bool check_limits) override;
 
     /// Called directly from ConcurrentJoin::addBlockToJoin
-    bool addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits);
+    bool addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits, size_t current_slot_id = 0, size_t total_slots = 1);
 
     void checkTypesOfKeys(const Block & block) const override;
 

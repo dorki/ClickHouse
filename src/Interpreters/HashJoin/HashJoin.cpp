@@ -594,7 +594,7 @@ bool HashJoin::addBlockToJoin(const Block & source_block, bool check_limits)
     return addBlockToJoin(materialized, ScatteredBlock::Selector(materialized.rows()), check_limits);
 }
 
-bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits)
+bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits, size_t current_slot_id, size_t total_slots)
 {
     if (!data)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Join data was released");
@@ -770,7 +770,9 @@ bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector sele
                             join_mask_col,
                             data->pool,
                             is_inserted,
-                            all_values_unique);
+                            all_values_unique,
+                            current_slot_id,
+                            total_slots);
 
                         if (flag_per_row)
                             used_flags->reinit<kind_, strictness_, std::is_same_v<std::decay_t<decltype(map)>, MapsAll>>(&stored_columns->columns);

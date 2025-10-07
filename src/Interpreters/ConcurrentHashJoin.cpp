@@ -1,3 +1,5 @@
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnSparse.h>
 #include <Columns/FilterDescription.h>
 #include <Columns/IColumn.h>
@@ -27,6 +29,8 @@
 #include <Common/scope_guard_safe.h>
 #include <Common/setThreadName.h>
 #include <Common/typeid_cast.h>
+#include <set>
+#include <thread>
 
 #include <Interpreters/HashJoin/HashJoin.h>
 #include <Interpreters/HashJoin/KeyGetter.h>
@@ -285,7 +289,7 @@ bool ConcurrentHashJoin::addBlockToJoin(const Block & right_block_, bool check_l
                 }
 
                 auto [block, selector] = std::move(dispatched_block).detachData();
-                bool limit_exceeded = !hash_join->data->addBlockToJoin(block, std::move(selector), check_limits);
+                bool limit_exceeded = !hash_join->data->addBlockToJoin(block, std::move(selector), check_limits, i, slots);
 
                 dispatched_block = {};
                 blocks_left--;
@@ -454,6 +458,98 @@ IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_shards, 
     ConstNullMapPtr null_map{};
     ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(key_columns, null_map);
 
+    /// Check if we have array join keys
+    const auto & clauses = join.getTableJoin().getClauses();
+    chassert(!clauses.empty(), "Expected at least one join clause");
+    const auto & clause = clauses[0];
+
+    size_t array_key_index = -1;
+    for (size_t i = 0; i < key_columns.size(); ++i)
+    {
+        if (clause.isArrayJoinKey(i) && clause.rightIsArray(i))
+        {
+            array_key_index = i;
+            break;
+        }
+    }
+
+    /// If we have array join keys, we need special handling for dispatch
+    if (array_key_index != static_cast<size_t>(-1))
+    {
+        std::cerr << "[DISPATCH] Array join key detected at index " << array_key_index << std::endl;
+
+        const auto * array_column = typeid_cast<const ColumnArray *>(key_columns[array_key_index]);
+        const auto & offsets = array_column->getOffsets();
+        const IColumn & array_data = array_column->getData();
+
+        /// Extract nested column from nullable arrays
+        const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
+        const IColumn * element_column = nullable_array_data ? &nullable_array_data->getNestedColumn() : &array_data;
+        const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
+
+        /// Substitute element column for array column
+        ColumnRawPtrs expanded_key_columns = key_columns;
+        expanded_key_columns[array_key_index] = element_column;
+
+        /// Calculate selector for elements (same as original, just with expanded columns)
+        auto calculate_element_selector = [&](auto & maps)
+        {
+            BlockHashes hash;
+            switch (join.getJoinedData()->type)
+            {
+            #define M(TYPE) \
+                case HashJoin::Type::TYPE: \
+                    hash = calculateHashes<typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
+                        *maps.TYPE, expanded_key_columns, join.getKeySizes().at(0)); \
+                    return hashToSelector(*maps.TYPE, hash, num_shards);
+                    APPLY_FOR_JOIN_VARIANTS(M)
+            #undef M
+                default:
+                    UNREACHABLE();
+            }
+        };
+
+        IColumn::Selector element_selector = std::visit(calculate_element_selector, join.getJoinedData()->maps.at(0));
+
+        /// Build row selector: duplicate rows for slots with multiple elements
+        const size_t num_rows = from_block.rows();
+        IColumn::Selector selector;
+        selector.reserve(num_rows); // At least one entry per row
+
+        for (size_t row = 0; row < num_rows; ++row)
+        {
+            size_t array_start = row == 0 ? 0 : offsets[row - 1];
+            size_t array_end = offsets[row];
+
+            /// Collect unique slots for this row's non-NULL elements
+            std::set<size_t> slots_for_row;
+            for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+            {
+                if (element_null_map && (*element_null_map)[elem_idx])
+                    continue;
+                slots_for_row.insert(element_selector[elem_idx]);
+            }
+
+            if (slots_for_row.empty())
+            {
+                /// All NULL - send to slot 0 (will be filtered during build)
+                selector.push_back(0);
+                std::cerr << "[DISPATCH] Row " << row << " → slot 0 (all NULL)" << std::endl;
+            }
+            else
+            {
+                /// Add one selector entry per slot (duplicates the row)
+                for (size_t slot : slots_for_row)
+                {
+                    selector.push_back(slot);
+                    std::cerr << "[DISPATCH] Row " << row << " → slot " << slot << std::endl;
+                }
+            }
+        }
+
+        return selector;
+    }
+
     auto calculate_selector = [&](auto & maps)
     {
         BlockHashes hash;
@@ -589,9 +685,17 @@ void ConcurrentHashJoin::onBuildPhaseFinish()
 {
     if (hash_joins[0]->data->twoLevelMapIsUsed())
     {
+            std::thread::id this_id = std::this_thread::get_id();
+
         // At this point, the build phase is finished. We need to build a shared common hash map to be used in the probe phase.
         // It is done in two steps:
         //     1. Merge hash maps into a single one. For that, we iterate over all sub-maps and move buckets from the current `HashJoin` instance to the common map.
+        std::cerr << "[MERGE] Starting merge, slots=" << slots << ", hash_joins.size()=" << hash_joins.size() << ", thread: " << this_id << std::endl;
+        for (size_t i = 0; i < hash_joins.size(); ++i)
+        {
+            std::cerr << "[MERGE] hash_joins[" << i << "] has map.size()=" << hash_joins[i]->data->getTotalRowCount() << ", thread: " << this_id << std::endl;
+        }
+
         for (size_t i = 1; i < slots; ++i)
         {
             auto move_buckets = [&](auto & lhs_maps, HashJoin::Type type, auto & rhs_maps, size_t idx)
@@ -606,7 +710,16 @@ void ConcurrentHashJoin::onBuildPhaseFinish()
                         for (size_t j = idx; j < lhs_map.NUM_BUCKETS; j += slots)
                         {
                             if (!lhs_map.impls[j].empty())
+                            {
+                                std::cerr << "[MERGE] ERROR: Bucket " << j << " in lhs (thread 0) is non-empty when merging from thread " << i
+                                          << ", lhs bucket size=" << lhs_map.impls[j].size()
+                                          << ", rhs bucket size=" << rhs_map.impls[j].size()
+                                          << ", NUM_BUCKETS=" << lhs_map.NUM_BUCKETS
+                                          << ", slots=" << slots << ", idx=" << idx 
+                                          << ", current_thread: " << this_id
+                                          << std::endl;
                                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected non-empty map");
+                            }
                             lhs_map.impls[j] = std::move(rhs_map.impls[j]);
                         }
                     })

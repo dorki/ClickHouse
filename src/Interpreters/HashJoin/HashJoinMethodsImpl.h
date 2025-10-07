@@ -1,4 +1,5 @@
 #pragma once
+#include <thread>
 
 #include <Columns/IColumn.h>
 #include <Columns/ColumnArray.h>
@@ -10,6 +11,7 @@
 #include <Interpreters/JoinUtils.h>
 
 #include <algorithm>
+#include <sstream>
 #include <type_traits>
 
 namespace DB
@@ -23,6 +25,12 @@ extern const int TYPE_MISMATCH;
 
 namespace
 {
+    /// Concept to check if HashMap has getBucketFromHash method (for two-level hash tables)
+    template <typename HashTable>
+    concept HasGetBucketFromHashMemberFunc = requires {
+        { std::declval<HashTable>().getBucketFromHash(static_cast<size_t>(0)) };
+    };
+
     /// Helper to check if any key column is an array (for array join semantics)
     /// Returns index of first array column, or -1 if none
     ssize_t findArrayKeyColumn(const ColumnRawPtrs & key_columns, const TableJoin & table_join)
@@ -65,7 +73,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
     const JoinCommon::JoinMask & join_mask,
     Arena & pool,
     bool & is_inserted,
-    bool & all_values_unique)
+    bool & all_values_unique,
+    size_t current_slot_id,
+    size_t total_slots)
 {
     switch (type)
     {
@@ -81,11 +91,11 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
         if (selector.isContinuousRange()) \
             insertFromBlockImplTypeCase< \
                 typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getRange(), null_map, join_mask, pool, is_inserted, all_values_unique); \
+                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getRange(), null_map, join_mask, pool, is_inserted, all_values_unique, current_slot_id, total_slots); \
         else \
             insertFromBlockImplTypeCase< \
                 typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getIndexes(), null_map, join_mask, pool, is_inserted, all_values_unique); \
+                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getIndexes(), null_map, join_mask, pool, is_inserted, all_values_unique, current_slot_id, total_slots); \
         break;
 
             APPLY_FOR_JOIN_VARIANTS(M)
@@ -196,7 +206,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
     const JoinCommon::JoinMask & join_mask,
     Arena & pool,
     bool & is_inserted,
-    bool & all_values_unique)
+    bool & all_values_unique,
+    size_t current_slot_id,
+    size_t total_slots)
 {
     [[maybe_unused]] constexpr bool mapped_one = std::is_same_v<typename HashMap::mapped_type, RowRef>;
     constexpr bool is_asof_join = STRICTNESS == JoinStrictness::Asof;
@@ -226,6 +238,10 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
         /// So values are NOT unique - this prevents RightAny promotion
         // TEMPORARILY COMMENTED OUT FOR TESTING:
         // all_values_unique = false;
+
+        /// Diagnostic logging for parallel_hash
+        std::thread::id this_id = std::this_thread::get_id();
+        std::cerr << "[BUILD] Array join detected on thread: " << this_id << std::endl;
     }
 
     for (size_t i = 0; i < rows; ++i)
@@ -286,13 +302,50 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                     continue;
                 }
 
+                /// For parallel hash (multiple slots), check bucket ownership
+                /// Only filter if we're using two-level maps (requires both runtime and compile-time checks)
+                if constexpr (HasGetBucketFromHashMemberFunc<HashMap>)
+                {
+                    if (total_slots > 1 && join.twoLevelMapIsUsed())
+                    {
+                        size_t hash = elem_key_getter.getHash(map, elem_idx, pool);
+                        size_t bucket = map.getBucketFromHash(hash);
+                        size_t slot = bucket & (total_slots - 1);
+
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                                  << " hash=" << hash << " bucket=" << bucket << " slot=" << slot << std::endl;
+
+                        if (slot != current_slot_id)
+                        {
+                            std::cerr << "[BUILD] Slot " << current_slot_id << " skipping element " << elem_idx
+                                      << " (belongs to slot " << slot << ")" << std::endl;
+                            continue;
+                        }
+
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " accepting element " << elem_idx << std::endl;
+                    }
+                    else if (total_slots > 1)
+                    {
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                                  << " (map not two-level yet, accepting all)" << std::endl;
+                    }
+                }
+                else if (total_slots > 1)
+                {
+                    std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                              << " (map type doesn't support two-level, accepting all)" << std::endl;
+                }
+
                 std::cerr << "[BUILD] Inserting element at idx " << elem_idx
                           << ", value: " << (*element_column)[elem_idx].dump() << std::endl;
 
                 /// Extract key from array element position elem_idx
                 auto emplace_result = elem_key_getter.emplaceKey(map, elem_idx, pool);
+                std::thread::id this_id = std::this_thread::get_id();
 
-                std::cerr << "[BUILD] Emplaced, isInserted=" << emplace_result.isInserted() << std::endl;
+                std::cerr << "[BUILD] Emplaced element, isInserted=" << emplace_result.isInserted()
+                            << ", thread: " << this_id 
+                          << ", map.size()=" << map.size() << std::endl;
 
                 /// Store reference to original row (ind), not the element position
                 if constexpr (is_asof_join)
@@ -335,7 +388,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
         }
     }
 
-    std::cerr << "[BUILD] Completed insertions. Hash table size: " << map.size()
+    std::thread::id this_id = std::this_thread::get_id();
+
+    std::cerr << "[BUILD] Completed insertions. Hash table size: " << map.size() << ", thread: " << this_id
               << ", all_values_unique=" << all_values_unique << std::endl;
 }
 
