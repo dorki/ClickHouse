@@ -203,27 +203,16 @@ IColumn::Selector createArrayAwareRowSelector(
     return createArrayAwareRowSelectorWithMapping(block, key_columns, array_info, num_shards, shard_func).selector;
 }
 
-/// Main function to create array-aware selector for block dispatch WITH mapping
-/// ShardFunction should be: size_t shard_func(const ColumnRawPtrs & key_columns, size_t row_index) -> size_t
-/// The function should return the final shard/bucket number (already masked/calculated)
+/// Overload that accepts pre-extracted key columns (useful when columns have been preprocessed)
 template <typename ShardFunction>
 SelectorWithMapping createArrayAwareSelectorWithMapping(
     const Block & block,
-    const Strings & key_column_names,
+    const ColumnRawPtrs & key_columns,
     const TableJoin & table_join,
     JoinTableSide /* side */,  // Currently unused, may be needed for future left-side array support
     size_t num_shards,
     ShardFunction shard_func)
 {
-    /// Extract key columns
-    ColumnRawPtrs key_columns;
-    key_columns.reserve(key_column_names.size());
-    for (const auto & key_name : key_column_names)
-    {
-        const auto & column = block.getByName(key_name).column;
-        key_columns.push_back(column.get());
-    }
-
     /// Check if we have array join keys
     const auto & clauses = table_join.getClauses();
     if (clauses.empty())
@@ -264,6 +253,31 @@ SelectorWithMapping createArrayAwareSelectorWithMapping(
 
     /// Create array-aware row selector with mapping
     return createArrayAwareRowSelectorWithMapping(block, key_columns, array_info, num_shards, shard_func);
+}
+
+/// Main function to create array-aware selector for block dispatch WITH mapping
+/// ShardFunction should be: size_t shard_func(const ColumnRawPtrs & key_columns, size_t row_index) -> size_t
+/// The function should return the final shard/bucket number (already masked/calculated)
+template <typename ShardFunction>
+SelectorWithMapping createArrayAwareSelectorWithMapping(
+    const Block & block,
+    const Strings & key_column_names,
+    const TableJoin & table_join,
+    JoinTableSide side,
+    size_t num_shards,
+    ShardFunction shard_func)
+{
+    /// Extract key columns
+    ColumnRawPtrs key_columns;
+    key_columns.reserve(key_column_names.size());
+    for (const auto & key_name : key_column_names)
+    {
+        const auto & column = block.getByName(key_name).column;
+        key_columns.push_back(column.get());
+    }
+
+    /// Call the overload that accepts pre-extracted columns
+    return createArrayAwareSelectorWithMapping(block, key_columns, table_join, side, num_shards, shard_func);
 }
 
 /// Backward-compatible version that returns only the selector

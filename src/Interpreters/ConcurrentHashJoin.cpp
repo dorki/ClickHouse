@@ -508,9 +508,10 @@ ArrayJoinDispatch::SelectorWithMapping selectDispatchBlockWithMapping(const Hash
     }
 
     /// Use the shared array-aware selector creation with mapping
+    /// Pass the pre-extracted key_columns (which have already been processed by extractNestedColumnsAndNullMap)
     return ArrayJoinDispatch::createArrayAwareSelectorWithMapping(
         from_block,
-        key_columns_names,
+        key_columns,
         join.getTableJoin(),
         side,
         num_shards,
