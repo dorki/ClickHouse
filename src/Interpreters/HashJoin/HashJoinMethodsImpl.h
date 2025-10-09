@@ -31,7 +31,7 @@ namespace
         { std::declval<HashTable>().getBucketFromHash(static_cast<size_t>(0)) };
     };
 
-    /// Helper to check if any key column is an array (for array join semantics)
+    /// Helper to check if any key column is an array during BUILD phase (right side for build)
     /// Returns index of first array column, or -1 if none
     ssize_t findArrayKeyColumn(const ColumnRawPtrs & key_columns, const TableJoin & table_join)
     {
@@ -59,6 +59,7 @@ namespace
         std::cerr << "[BUILD] No array key found" << std::endl;
         return -1;
     }
+
 }
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
 void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
@@ -181,16 +182,42 @@ template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
 template <typename KeyGetter, bool is_asof_join>
 KeyGetter HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::createKeyGetter(const ColumnRawPtrs & key_columns, const Sizes & key_sizes)
 {
+    /// Check if any key column is an array - if so, we need to extract element columns
+    /// Arrays are not contiguous memory, so we use their inner data column instead
+    ColumnRawPtrs adjusted_key_columns = key_columns;
+
+    for (size_t i = 0; i < key_columns.size(); ++i)
+    {
+        if (const auto * array_col = typeid_cast<const ColumnArray *>(key_columns[i]))
+        {
+            /// Replace array column with its data column (the flattened elements)
+            const IColumn * data_col = &array_col->getData();
+
+            /// If the data column is nullable, extract the nested column
+            /// ColumnNullable is also not contiguous (has nested column + null map)
+            if (const auto * nullable_col = typeid_cast<const ColumnNullable *>(data_col))
+            {
+                data_col = &nullable_col->getNestedColumn();
+                std::cerr << "[createKeyGetter] Array column at index " << i
+                          << " has nullable elements, using nested column" << std::endl;
+            }
+
+            adjusted_key_columns[i] = data_col;
+            std::cerr << "[createKeyGetter] Detected array column at index " << i
+                      << ", using element column instead" << std::endl;
+        }
+    }
+
     if constexpr (is_asof_join)
     {
-        auto key_column_copy = key_columns;
+        auto key_column_copy = adjusted_key_columns;
         auto key_size_copy = key_sizes;
         key_column_copy.pop_back();
         key_size_copy.pop_back();
         return KeyGetter(key_column_copy, key_size_copy, nullptr);
     }
     else
-        return KeyGetter(key_columns, key_sizes, nullptr);
+        return KeyGetter(adjusted_key_columns, key_sizes, nullptr);
 }
 
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
@@ -428,6 +455,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::switchJoinRightColumns(
     HashJoin::Type type,
     JoinStuff::JoinUsedFlags & used_flags)
 {
+    /// Array columns are now handled in createKeyGetter() which extracts element columns
+    /// The actual array expansion logic is in joinRightColumns() probing code
+
     constexpr bool is_asof_join = STRICTNESS == JoinStrictness::Asof;
     switch (type)
     {
@@ -717,29 +747,104 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
             else
                 row_acceptable = !join_keys.isRowFiltered(ind);
 
-            using FindResult = typename KeyGetter::FindResult;
-            auto find_result = row_acceptable ? key_getter.findKey(*map, ind, pool) : FindResult();
+            /// Check if any key column is an array - if so, we need array-aware probing
+            /// Skip this for KeyGetterEmpty (used for EMPTY/CROSS joins with no keys)
+            constexpr bool is_key_getter_empty = std::is_same_v<KeyGetter, KeyGetterEmpty<typename MapsTemplate::MappedType>>;
+            ssize_t array_key_idx = -1;
 
-            if (ind < 3)
+            if constexpr (!is_key_getter_empty)
             {
-                std::cerr << "[PROBE] Row " << ind << " (i=" << i << "): row_acceptable=" << row_acceptable
-                          << ", found=" << find_result.isFound();
-                if (join_keys.key_columns.size() > 0 && join_keys.key_columns[0] && ind < join_keys.key_columns[0]->size())
-                    std::cerr << ", looking for value=" << (*join_keys.key_columns[0])[ind].dump();
-                std::cerr << std::endl;
+                for (size_t key_idx = 0; key_idx < join_keys.key_columns.size(); ++key_idx)
+                {
+                    if (const auto * array_col = typeid_cast<const ColumnArray *>(join_keys.key_columns[key_idx]))
+                    {
+                        array_key_idx = static_cast<ssize_t>(key_idx);
+                        std::cerr << "[PROBE] Found array column at key index " << key_idx << std::endl;
+                        break;
+                    }
+                }
             }
 
-            if (find_result.isFound())
+            /// Array expansion block - only compile for non-empty KeyGetters
+            bool array_processed = false;
+            if constexpr (!is_key_getter_empty)
             {
-                right_row_found = true;
+                if (array_key_idx >= 0 && row_acceptable)
+                {
+                    array_processed = true;
+                    /// Array-aware probing: expand array and probe each element
+                    /// Note: key_getter was already created with element columns by createKeyGetter()
+                    const auto * array_column = typeid_cast<const ColumnArray *>(join_keys.key_columns[array_key_idx]);
+                    const auto & offsets = array_column->getOffsets();
+                    size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
+                    size_t array_end = offsets[ind];
+
+                    std::cerr << "[PROBE] Row " << ind << ": Array has " << (array_end - array_start) << " elements" << std::endl;
+
+                    /// Check for NULL elements in the array data
+                    const IColumn & array_data = array_column->getData();
+                    const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
+                    const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
+
+                    /// Probe each array element using the existing key_getter
+                    /// key_getter was created with element columns, so we use element indices
+                    for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+                    {
+                        /// Skip NULL elements
+                        if (element_null_map && (*element_null_map)[elem_idx])
+                        {
+                            std::cerr << "[PROBE] Skipping NULL element at idx " << elem_idx << std::endl;
+                            continue;
+                        }
+
+                        /// Use the existing key_getter which already has element columns
+                        auto find_result = key_getter.findKey(*map, elem_idx, pool);
+
+                        if (elem_idx - array_start < 3)
+                        {
+                            std::cerr << "[PROBE] Element " << (elem_idx - array_start) << " at idx " << elem_idx
+                                      << ": found=" << find_result.isFound()
+                                      << ", value=" << array_data[elem_idx].dump() << std::endl;
+                        }
+
+                        if (find_result.isFound())
+                        {
+                            right_row_found = true;
+                            std::cerr << "[PROBE] Element match found, processing..." << std::endl;
+                            processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                                find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                        }
+                    }
+                }
+            }
+
+            if (!array_processed)
+            {
+                /// Normal non-array probing (for KeyGetterEmpty or when no array key is found)
+                using FindResult = typename KeyGetter::FindResult;
+                auto find_result = row_acceptable ? key_getter.findKey(*map, ind, pool) : FindResult();
+
                 if (ind < 3)
-                    std::cerr << "[PROBE] Row " << ind << ": Processing match, current_offset before=" << current_offset
-                              << ", added_columns.size before=" << added_columns.size() << std::endl;
-                processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
-                    find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
-                if (ind < 3)
-                    std::cerr << "[PROBE] Row " << ind << ": After processMatch, current_offset after=" << current_offset
-                              << ", added_columns.size after=" << added_columns.size() << std::endl;
+                {
+                    std::cerr << "[PROBE] Row " << ind << " (i=" << i << "): row_acceptable=" << row_acceptable
+                              << ", found=" << find_result.isFound();
+                    if (join_keys.key_columns.size() > 0 && join_keys.key_columns[0] && ind < join_keys.key_columns[0]->size())
+                        std::cerr << ", looking for value=" << (*join_keys.key_columns[0])[ind].dump();
+                    std::cerr << std::endl;
+                }
+
+                if (find_result.isFound())
+                {
+                    right_row_found = true;
+                    if (ind < 3)
+                        std::cerr << "[PROBE] Row " << ind << ": Processing match, current_offset before=" << current_offset
+                                  << ", added_columns.size before=" << added_columns.size() << std::endl;
+                    processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                        find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                    if (ind < 3)
+                        std::cerr << "[PROBE] Row " << ind << ": After processMatch, current_offset after=" << current_offset
+                                  << ", added_columns.size after=" << added_columns.size() << std::endl;
+                }
             }
         }
 

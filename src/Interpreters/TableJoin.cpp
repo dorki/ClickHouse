@@ -418,14 +418,38 @@ Names TableJoin::requiredJoinedNames() const
 NameSet TableJoin::requiredRightKeys() const
 {
     NameSet required;
-    forAllKeys<RightSideTag>(clauses, [this, &required](const auto & name)
+
+    /// Helper to check if a key index is an array join key
+    auto is_array_join_key = [this](size_t clause_idx, size_t key_idx) -> bool
     {
-        auto rename = renamedRightColumnName(name);
-        for (const auto & column : columns_added_by_join)
-            if (rename == column.name)
-                required.insert(name);
-        return true;
-    });
+        if (clause_idx >= clauses.size())
+            return false;
+        return clauses[clause_idx].isArrayJoinKey(key_idx);
+    };
+
+    for (size_t clause_idx = 0; clause_idx < clauses.size(); ++clause_idx)
+    {
+        const auto & clause = clauses[clause_idx];
+        for (size_t key_idx = 0; key_idx < clause.key_names_right.size(); ++key_idx)
+        {
+            const auto & name = clause.key_names_right[key_idx];
+            auto rename = renamedRightColumnName(name);
+
+            /// Array join keys should not be in required_right_keys
+            /// They will be fetched from hash table via sample_block_with_columns_to_add
+            bool is_array_key = is_array_join_key(clause_idx, key_idx);
+
+            for (const auto & column : columns_added_by_join)
+            {
+                if (rename == column.name && !is_array_key)
+                {
+                    required.insert(name);
+                    break;
+                }
+            }
+        }
+    }
+
     return required;
 }
 

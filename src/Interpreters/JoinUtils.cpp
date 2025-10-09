@@ -559,18 +559,32 @@ JoinMask getColumnAsMask(const Block & block, const String & column_name)
 }
 
 
-void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others)
+void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others, const TableJoin * table_join)
 {
     block_others = materializeBlock(sample_block);
 
-    for (const String & column_name : key_names)
+    for (size_t i = 0; i < key_names.size(); ++i)
     {
+        const String & column_name = key_names[i];
+
+        /// Check if this is an array join key
+        bool is_array_join_key = false;
+        if (table_join && table_join->oneDisjunct())
+        {
+            const auto & clause = table_join->getOnlyClause();
+            is_array_join_key = clause.isArrayJoinKey(i);
+        }
+
         /// Extract right keys with correct keys order. There could be the same key names.
         if (!block_keys.has(column_name))
         {
             auto & col = block_others.getByName(column_name);
             block_keys.insert(col);
-            block_others.erase(column_name);
+
+            /// For array join keys, keep them in block_others so they're fetched from hash table
+            /// For regular keys, remove them from block_others (they'll be copied from left)
+            if (!is_array_join_key)
+                block_others.erase(column_name);
         }
     }
 }

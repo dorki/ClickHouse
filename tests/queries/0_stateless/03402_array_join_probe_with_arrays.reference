@@ -1,0 +1,50 @@
+Test 1: INNER JOIN - array on probing side
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Users	Bob
+Users	Charlie
+Test 2: Parallel hash
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Users	Bob
+Users	Charlie
+Test 3: Grace hash
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Users	Bob
+Users	Charlie
+Test 4: LEFT JOIN
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Empty
+NoMatch
+Users	Bob
+Users	Charlie
+Test 5: Empty arrays
+Test 6: With additional conditions
+Admins	Bob
+Developers	Charlie
+Users	Bob
+Users	Charlie
+Test 7: Old analyzer - hash
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Users	Bob
+Users	Charlie
+Test 8: Old analyzer - parallel_hash
+Admins	Alice
+Admins	Bob
+Developers	Alice
+Developers	Charlie
+Users	Bob
+Users	Charlie

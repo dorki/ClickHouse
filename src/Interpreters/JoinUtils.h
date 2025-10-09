@@ -110,7 +110,7 @@ bool typesEqualUpToNullability(DataTypePtr left_type, DataTypePtr right_type);
 JoinMask getColumnAsMask(const Block & block, const String & column_name);
 
 /// Split key and other columns by keys name list
-void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others);
+void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others, const TableJoin * table_join = nullptr);
 
 void changeLowCardinalityInplace(ColumnWithTypeAndName & column);
 
