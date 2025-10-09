@@ -82,15 +82,6 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
-namespace
-{
-LoggerPtr getPlannerJoinsLogger()
-{
-    static LoggerPtr logger = getLogger("PlannerJoins");
-    return logger;
-}
-}
-
 void JoinClause::dump(WriteBuffer & buffer) const
 {
     auto dump_dag_nodes = [&](const ActionsDAG::NodeRawConstPtrs & dag_nodes)
@@ -291,8 +282,6 @@ void buildJoinClauseImpl(
     if (function_node)
     {
         function_name = function_node->getFunction()->getName();
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseImpl: function_name from getFunction()->getName() = '{}'", function_name);
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseImpl: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
     }
 
     auto asof_inequality = getASOFJoinInequality(function_name);
@@ -402,7 +391,6 @@ void buildJoinClauseImpl(
     }
     else if (function_name == "has" && function_node->getArguments().getNodes().size() == 2)
     {
-        LOG_DEBUG(getPlannerJoinsLogger(), "Detected has() function in JOIN ON, will process as potential array join key");
         /// Handle has(array_col, element_col) as an array join key
         const auto array_child = function_node->getArguments().getNodes().at(0);
         const auto element_child = function_node->getArguments().getNodes().at(1);
@@ -441,8 +429,6 @@ void buildJoinClauseImpl(
                     ? appendExpression(right_dag, element_key, planner_context, join_node)
                     : appendExpression(right_dag, array_key, planner_context, join_node);
 
-                LOG_DEBUG(getPlannerJoinsLogger(), "Adding array join key: left='{}', right='{}', left_is_array={}",
-                          left_node->result_name, right_node->result_name, left_is_array);
                 join_clause.addArrayJoinKey(left_node, right_node, left_is_array);
             }
             else
@@ -573,8 +559,6 @@ void buildJoinClauseWithTracking(
     if (function_node)
     {
         function_name = function_node->getFunction()->getName();
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunction()->getName() = '{}'", function_name);
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
     }
 
     /// For 'and' function go into children
@@ -878,11 +862,8 @@ std::pair<JoinClauses, bool /*is_inequal_join*/> buildAllJoinClauses(
     const auto is_hash_join_enabled = TableJoin::isEnabledAlgorithm(join_algorithms, JoinAlgorithm::HASH)
         || TableJoin::isEnabledAlgorithm(join_algorithms, JoinAlgorithm::AUTO);
     const bool allow_general = planner_context->getQueryContext()->getSettingsRef()[Setting::allow_general_join_planning];
-    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: is_hash_join_enabled={}, allow_general_join_planning={}",
-              is_hash_join_enabled, allow_general);
     if (is_hash_join_enabled && allow_general)
     {
-        LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: Taking buildJoinClauses path (allow_general_join_planning=true)");
         auto join_clauses = buildJoinClauses(
             left_join_actions,
             right_join_actions,
@@ -901,11 +882,9 @@ std::pair<JoinClauses, bool /*is_inequal_join*/> buildAllJoinClauses(
         return std::make_pair(std::move(join_clauses), has_residual_filters);
     }
 
-    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: Taking buildJoinClause path (allow_general_join_planning=false or not hash join)");
     bool has_residual_filters = false;
     JoinClauses join_clauses;
     const auto & function_name = function_node.getFunction()->getName();
-    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: function_name = '{}'", function_name);
     if (function_name == "or")
     {
         for (const auto & child : function_node.getArguments())
@@ -964,7 +943,6 @@ JoinClausesAndActions buildJoinClausesAndActions(
     ActionsDAG post_join_actions(result_relation_columns);
 
     auto join_expression = getJoinExpressionFromNode(join_node);
-    LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClausesAndActions: join_expression = {}", join_expression->formatASTForErrorMessage());
 
     auto * function_node = join_expression->as<FunctionNode>();
     if (!function_node)

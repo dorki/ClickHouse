@@ -538,16 +538,9 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
     };
     FirstHasInfo first_has_ref;
 
-    std::cerr << "[DEBUG] Starting loop with predicates.size()=" << predicates.size() << "\n";
-    for (size_t i = 0; i < predicates.size(); ++i)
-    {
-        std::cerr << "[DEBUG] predicates[" << i << "]=" << predicates[i].dump() << "\n";
-    }
-
     for (auto & pred : predicates)
     {
         JoinActionRef predicate = std::move(pred);
-        std::cerr << "[DEBUG] Processing predicate: " << predicate.dump() << "\n";
 
         /// First, check for equality conditions - these take priority
         auto [predicate_op, eq_lhs, eq_rhs] = predicate.asBinaryPredicate();
@@ -581,7 +574,6 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
                 }
 
                 has_join_predicates = true;
-                // std::cerr << "Adding key " << eq_lhs.getColumnName() << ' ' << eq_rhs.getColumnName() << std::endl;
                 table_join_clause.addKey(eq_lhs.getColumnName(), eq_rhs.getColumnName(), null_safe_comparison);
 
                 /// We applied predicate, do not add it to residual conditions
@@ -652,18 +644,10 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
     /// After loop: if first_has_ref is still set, use it as array join key
     if (first_has_ref.has_value)
     {
-        std::cerr << "[DEBUG] Processing saved has() at end of loop\n";
-        std::cerr << "[DEBUG] left_is_array=" << first_has_ref.left_is_array << "\n";
-        std::cerr << "[DEBUG] lhs column=" << first_has_ref.lhs.getColumnName() << " fromLeft=" << first_has_ref.lhs.fromLeft() << " fromRight=" << first_has_ref.lhs.fromRight() << "\n";
-        std::cerr << "[DEBUG] rhs column=" << first_has_ref.rhs.getColumnName() << " fromLeft=" << first_has_ref.rhs.fromLeft() << " fromRight=" << first_has_ref.rhs.fromRight() << "\n";
-
         if (first_has_ref.left_is_array)
         {
             /// has(left_array, right_scalar) - left is array
-            std::cerr << "[DEBUG] BEFORE conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
             predicateOperandsToCommonTypeForArrayJoin(first_has_ref.lhs, first_has_ref.rhs, planning_context);
-            std::cerr << "[DEBUG] AFTER conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
-            std::cerr << "[DEBUG] Adding array join key: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << " left_is_array=true\n";
             has_join_predicates = true;
             table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), true);
             used_expressions.push_back(first_has_ref.lhs);
@@ -672,21 +656,12 @@ bool addJoinPredicatesToTableJoin(std::vector<JoinActionRef> & predicates, Table
         else
         {
             /// has(right_array, left_scalar) - right is array
-            std::cerr << "[DEBUG] BEFORE conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
             predicateOperandsToCommonTypeForArrayJoin(first_has_ref.rhs, first_has_ref.lhs, planning_context);
-            std::cerr << "[DEBUG] AFTER conversion: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << "\n";
-            std::cerr << "[DEBUG] Adding array join key: left=" << first_has_ref.lhs.getColumnName() << " right=" << first_has_ref.rhs.getColumnName() << " left_is_array=false\n";
             has_join_predicates = true;
             table_join_clause.addArrayJoinKey(first_has_ref.lhs.getColumnName(), first_has_ref.rhs.getColumnName(), false);
             used_expressions.push_back(first_has_ref.lhs);
             used_expressions.push_back(first_has_ref.rhs);
         }
-    }
-
-    std::cerr << "[DEBUG] new_predicates size=" << new_predicates.size() << "\n";
-    for (size_t i = 0; i < new_predicates.size(); ++i)
-    {
-        std::cerr << "[DEBUG] new_predicates[" << i << "]=" << new_predicates[i].dump() << " fromLeft=" << new_predicates[i].fromLeft() << " fromRight=" << new_predicates[i].fromRight() << "\n";
     }
 
     predicates = std::move(new_predicates);
@@ -1087,42 +1062,19 @@ static QueryPlanNode buildPhysicalJoinImpl(
         join_expression.erase(found_asof_predicate_it);
     }
 
-    std::cerr << "[DEBUG] Before extracting pre-filters, join_expression size=" << join_expression.size() << "\n";
-    for (size_t i = 0; i < join_expression.size(); ++i)
-    {
-        std::cerr << "[DEBUG] join_expression[" << i << "]=" << join_expression[i].dump() << " fromLeft=" << join_expression[i].fromLeft() << " fromRight=" << join_expression[i].fromRight() << "\n";
-    }
-
     if (auto left_pre_filter_condition = concatConditions(join_expression, JoinTableSide::Left))
     {
-        std::cerr << "[DEBUG] Extracted left pre-filter: " << left_pre_filter_condition.getColumnName() << "\n";
         table_join_clauses.at(table_join_clauses.size() - 1).analyzer_left_filter_condition_column_name = left_pre_filter_condition.getColumnName();
         used_expressions.push_back(left_pre_filter_condition);
-    }
-    else
-    {
-        std::cerr << "[DEBUG] No left pre-filter extracted\n";
     }
 
     if (auto right_pre_filter_condition = concatConditions(join_expression, JoinTableSide::Right))
     {
-        std::cerr << "[DEBUG] Extracted right pre-filter: " << right_pre_filter_condition.getColumnName() << "\n";
         table_join_clauses.at(table_join_clauses.size() - 1).analyzer_right_filter_condition_column_name = right_pre_filter_condition.getColumnName();
         used_expressions.push_back(right_pre_filter_condition);
     }
-    else
-    {
-        std::cerr << "[DEBUG] No right pre-filter extracted\n";
-    }
-
-    std::cerr << "[DEBUG] After extracting pre-filters, join_expression size=" << join_expression.size() << "\n";
-    for (size_t i = 0; i < join_expression.size(); ++i)
-    {
-        std::cerr << "[DEBUG] Remaining join_expression[" << i << "]=" << join_expression[i].dump() << "\n";
-    }
 
     join_operator.residual_filter.append_range(join_expression);
-    std::cerr << "[DEBUG] residual_filter size=" << join_operator.residual_filter.size() << "\n";
     JoinActionRef residual_filter_condition = concatConditions(join_operator.residual_filter);
     std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> actions_after_join_fold;
     for (const auto * action : actions_after_join)

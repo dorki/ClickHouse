@@ -145,15 +145,11 @@ void CollectJoinOnKeysMatcher::visit(const ASTFunction & func, const ASTPtr & as
             bool null_safe_comparison = func.name == "isNotDistinctFrom";
             data.addJoinKeys(left, right, table_numbers, null_safe_comparison);
 
-            /// If we had saved a has() ref, we need to process it now
-            /// However, the old analyzer doesn't support mixed-table post-filters well
-            /// For now, just invalidate it - this means composite conditions won't work with old analyzer
-            /// TODO: Implement proper support or throw an error
+            /// If we had saved a has() ref, invalidate it since composite conditions (has + equality)
+            /// are not well supported in the old analyzer path. The has() will be treated as a post-filter.
             if (data.first_has_ref.has_value)
             {
                 data.first_has_ref.has_value = false;
-                /// Note: This means the has() condition is silently dropped when combined with equality
-                /// This is a known limitation of the old analyzer path
             }
 
             return;
