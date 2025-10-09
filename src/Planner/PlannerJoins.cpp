@@ -6,6 +6,7 @@
 #include <IO/WriteBufferFromString.h>
 
 #include <DataTypes/getLeastSupertype.h>
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 
@@ -46,6 +47,8 @@
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 
+#include <Common/logger_useful.h>
+
 #include <stack>
 
 
@@ -77,6 +80,15 @@ namespace ErrorCodes
     extern const int INVALID_JOIN_ON_EXPRESSION;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+}
+
+namespace
+{
+LoggerPtr getPlannerJoinsLogger()
+{
+    static LoggerPtr logger = getLogger("PlannerJoins");
+    return logger;
+}
 }
 
 void JoinClause::dump(WriteBuffer & buffer) const
@@ -173,6 +185,12 @@ JoinClause JoinClause::concatClauses(const JoinClause & lhs, const JoinClause & 
     // And offset the indices from rhs according to lhs size
     for (const auto key_index : rhs.nullsafe_compare_key_indexes)
         result.nullsafe_compare_key_indexes.insert(key_index + lhs_key_size);
+
+    // The same with array join key indexes
+    result.array_join_key_indexes = lhs.array_join_key_indexes;
+    // And offset the indices from rhs according to lhs size
+    for (const auto & [key_index, left_is_array] : rhs.array_join_key_indexes)
+        result.array_join_key_indexes[key_index + lhs_key_size] = left_is_array;
 
     return result;
 }
@@ -271,7 +289,11 @@ void buildJoinClauseImpl(
     std::string function_name;
     auto * function_node = join_expression->as<FunctionNode>();
     if (function_node)
+    {
         function_name = function_node->getFunction()->getName();
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseImpl: function_name from getFunction()->getName() = '{}'", function_name);
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseImpl: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
+    }
 
     auto asof_inequality = getASOFJoinInequality(function_name);
     bool is_asof_join_inequality = join_node.getStrictness() == JoinStrictness::Asof && asof_inequality != ASOFJoinInequality::None;
@@ -378,6 +400,80 @@ void buildJoinClauseImpl(
             }
         }
     }
+    else if (function_name == "has" && function_node->getArguments().getNodes().size() == 2)
+    {
+        LOG_DEBUG(getPlannerJoinsLogger(), "Detected has() function in JOIN ON, will process as potential array join key");
+        /// Handle has(array_col, element_col) as an array join key
+        const auto array_child = function_node->getArguments().getNodes().at(0);
+        const auto element_child = function_node->getArguments().getNodes().at(1);
+
+        auto array_expression_sides
+            = extractJoinTableSidesFromExpression(array_child.get(), left_table_expressions, right_table_expressions, join_node);
+
+        auto element_expression_sides
+            = extractJoinTableSidesFromExpression(element_child.get(), left_table_expressions, right_table_expressions, join_node);
+
+        if (array_expression_sides.empty() && element_expression_sides.empty())
+        {
+            throw Exception(
+                ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+                "JOIN {} ON expression expected non-empty left and right table expressions",
+                join_node.formatASTForErrorMessage());
+        }
+
+        if (array_expression_sides.size() == 1 && element_expression_sides.size() == 1)
+        {
+            auto array_expression_side = *array_expression_sides.begin();
+            auto element_expression_side = *element_expression_sides.begin();
+
+            if (array_expression_side != element_expression_side)
+            {
+                /// Array and element are from different tables - this is array join key
+                auto array_key = array_child;
+                auto element_key = element_child;
+                bool left_is_array = (array_expression_side == JoinTableSide::Left);
+
+                /// Always put element on left, array on right for consistent key ordering
+                const auto * left_node = left_is_array
+                    ? appendExpression(left_dag, array_key, planner_context, join_node)
+                    : appendExpression(left_dag, element_key, planner_context, join_node);
+                const auto * right_node = left_is_array
+                    ? appendExpression(right_dag, element_key, planner_context, join_node)
+                    : appendExpression(right_dag, array_key, planner_context, join_node);
+
+                LOG_DEBUG(getPlannerJoinsLogger(), "Adding array join key: left='{}', right='{}', left_is_array={}",
+                          left_node->result_name, right_node->result_name, left_is_array);
+                join_clause.addArrayJoinKey(left_node, right_node, left_is_array);
+            }
+            else
+            {
+                /// Both from same table - add as condition
+                auto expression_side = array_expression_side;
+                auto & dag = expression_side == JoinTableSide::Left ? left_dag : right_dag;
+                const auto * node = appendExpression(dag, join_expression, planner_context, join_node);
+                join_clause.addCondition(expression_side, node);
+            }
+        }
+        else
+        {
+            /// One of the expressions is not a simple column reference - treat as regular condition
+            auto expression_sides
+                = extractJoinTableSidesFromExpression(join_expression.get(), left_table_expressions, right_table_expressions, join_node);
+            if (expression_sides.empty() || expression_sides.size() == 1)
+            {
+                auto expression_side = expression_sides.empty() ? JoinTableSide::Right : *expression_sides.begin();
+                auto & dag = expression_side == JoinTableSide::Left ? left_dag : right_dag;
+                const auto * node = appendExpression(dag, join_expression, planner_context, join_node);
+                join_clause.addCondition(expression_side, node);
+            }
+            else
+            {
+                /// Expression involves both tables - add as residual
+                const auto * node = appendExpression(joined_dag, join_expression, planner_context, join_node);
+                join_clause.addResidualCondition(node);
+            }
+        }
+    }
     else
     {
         auto expression_sides
@@ -453,7 +549,14 @@ void buildSimpleJoinClause(
         join_clause);
 }
 
-void buildJoinClause(
+/// Track first has() predicate for single-pass algorithm
+struct FirstHasInfo
+{
+    QueryTreeNodePtr original_expression;
+    bool has_value = false;
+};
+
+void buildJoinClauseWithTracking(
     ActionsDAG & left_dag,
     ActionsDAG & right_dag,
     ActionsDAG & joined_dag,
@@ -462,19 +565,24 @@ void buildJoinClause(
     const TableExpressionSet & left_table_expressions,
     const TableExpressionSet & right_table_expressions,
     const JoinNode & join_node,
-    JoinClause & join_clause)
+    JoinClause & join_clause,
+    FirstHasInfo & first_has_ref)
 {
     std::string function_name;
     auto * function_node = join_expression->as<FunctionNode>();
     if (function_node)
+    {
         function_name = function_node->getFunction()->getName();
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunction()->getName() = '{}'", function_name);
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClauseWithTracking: function_name from getFunctionName() = '{}'", function_node->getFunctionName());
+    }
 
     /// For 'and' function go into children
     if (function_name == "and")
     {
         for (const auto & child : function_node->getArguments())
         {
-            buildJoinClause(
+            buildJoinClauseWithTracking(
                 left_dag,
                 right_dag,
                 joined_dag,
@@ -483,12 +591,85 @@ void buildJoinClause(
                 left_table_expressions,
                 right_table_expressions,
                 join_node,
-                join_clause);
+                join_clause,
+                first_has_ref);
         }
 
         return;
     }
 
+    /// Check if this is an equality predicate
+    bool is_equality = (function_name == "equals" || function_name == "isNotDistinctFrom");
+
+    /// Check if this is a has() predicate
+    bool is_has = (function_name == "has" && function_node && function_node->getArguments().getNodes().size() == 2);
+
+    if (is_equality)
+    {
+        /// Process equality - will add as join key in buildJoinClauseImpl
+        buildJoinClauseImpl(
+            left_dag,
+            right_dag,
+            joined_dag,
+            planner_context,
+            join_expression,
+            left_table_expressions,
+            right_table_expressions,
+            join_node,
+            false,
+            join_clause);
+
+        /// If we had saved a has() ref, process it as post-filter now since we found an equality
+        if (first_has_ref.has_value)
+        {
+            buildJoinClauseImpl(
+                left_dag,
+                right_dag,
+                joined_dag,
+                planner_context,
+                first_has_ref.original_expression,
+                left_table_expressions,
+                right_table_expressions,
+                join_node,
+                false,
+                join_clause);
+            first_has_ref.has_value = false;
+        }
+        return;
+    }
+    else if (is_has)
+    {
+        /// Check if this is the first has() and no keys added yet
+        bool no_keys_yet = join_clause.getLeftKeyNodes().empty();
+
+        if (!first_has_ref.has_value && no_keys_yet)
+        {
+            /// Save this as potential array join key
+            first_has_ref.original_expression = join_expression;
+            first_has_ref.has_value = true;
+            /// Don't process yet - wait to see if equality comes
+            return;
+        }
+        else
+        {
+            /// Either not first has(), or keys already exist, or first_has was invalidated
+            /// Process as regular condition (will become post-filter)
+            buildJoinClauseImpl(
+                left_dag,
+                right_dag,
+                joined_dag,
+                planner_context,
+                join_expression,
+                left_table_expressions,
+                right_table_expressions,
+                join_node,
+                false,
+                join_clause);
+            return;
+        }
+    }
+
+    /// Other predicates - process normally
     buildJoinClauseImpl(
         left_dag,
         right_dag,
@@ -500,6 +681,48 @@ void buildJoinClause(
         join_node,
         false,
         join_clause);
+}
+
+void buildJoinClause(
+    ActionsDAG & left_dag,
+    ActionsDAG & right_dag,
+    ActionsDAG & joined_dag,
+    const PlannerContextPtr & planner_context,
+    const QueryTreeNodePtr & join_expression,
+    const TableExpressionSet & left_table_expressions,
+    const TableExpressionSet & right_table_expressions,
+    const JoinNode & join_node,
+    JoinClause & join_clause)
+{
+    FirstHasInfo first_has_ref;
+
+    buildJoinClauseWithTracking(
+        left_dag,
+        right_dag,
+        joined_dag,
+        planner_context,
+        join_expression,
+        left_table_expressions,
+        right_table_expressions,
+        join_node,
+        join_clause,
+        first_has_ref);
+
+    /// After recursion finishes: if first_has_ref is still set, process it as array join key
+    if (first_has_ref.has_value)
+    {
+        buildJoinClauseImpl(
+            left_dag,
+            right_dag,
+            joined_dag,
+            planner_context,
+            first_has_ref.original_expression,
+            left_table_expressions,
+            right_table_expressions,
+            join_node,
+            false,
+            join_clause);
+    }
 }
 
 JoinClauses buildJoinClauses(
@@ -654,8 +877,12 @@ std::pair<JoinClauses, bool /*is_inequal_join*/> buildAllJoinClauses(
     const auto & join_algorithms = planner_context->getQueryContext()->getSettingsRef()[Setting::join_algorithm];
     const auto is_hash_join_enabled = TableJoin::isEnabledAlgorithm(join_algorithms, JoinAlgorithm::HASH)
         || TableJoin::isEnabledAlgorithm(join_algorithms, JoinAlgorithm::AUTO);
-    if (is_hash_join_enabled && planner_context->getQueryContext()->getSettingsRef()[Setting::allow_general_join_planning])
+    const bool allow_general = planner_context->getQueryContext()->getSettingsRef()[Setting::allow_general_join_planning];
+    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: is_hash_join_enabled={}, allow_general_join_planning={}",
+              is_hash_join_enabled, allow_general);
+    if (is_hash_join_enabled && allow_general)
     {
+        LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: Taking buildJoinClauses path (allow_general_join_planning=true)");
         auto join_clauses = buildJoinClauses(
             left_join_actions,
             right_join_actions,
@@ -674,9 +901,11 @@ std::pair<JoinClauses, bool /*is_inequal_join*/> buildAllJoinClauses(
         return std::make_pair(std::move(join_clauses), has_residual_filters);
     }
 
+    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: Taking buildJoinClause path (allow_general_join_planning=false or not hash join)");
     bool has_residual_filters = false;
     JoinClauses join_clauses;
     const auto & function_name = function_node.getFunction()->getName();
+    LOG_DEBUG(getPlannerJoinsLogger(), "buildAllJoinClauses: function_name = '{}'", function_name);
     if (function_name == "or")
     {
         for (const auto & child : function_node.getArguments())
@@ -735,6 +964,7 @@ JoinClausesAndActions buildJoinClausesAndActions(
     ActionsDAG post_join_actions(result_relation_columns);
 
     auto join_expression = getJoinExpressionFromNode(join_node);
+    LOG_DEBUG(getPlannerJoinsLogger(), "buildJoinClausesAndActions: join_expression = {}", join_expression->formatASTForErrorMessage());
 
     auto * function_node = join_expression->as<FunctionNode>();
     if (!function_node)
@@ -846,7 +1076,66 @@ JoinClausesAndActions buildJoinClausesAndActions(
             auto & left_key_node = join_clause.getLeftKeyNodes()[i];
             auto & right_key_node = join_clause.getRightKeyNodes()[i];
 
-            if (!left_key_node->result_type->equals(*right_key_node->result_type))
+            /// Handle array join keys - need to compare element type with scalar type
+            if (join_clause.isArrayJoinKey(i))
+            {
+                bool left_is_array = join_clause.leftIsArray(i);
+                auto & array_key_node = left_is_array ? left_key_node : right_key_node;
+                auto & scalar_key_node = left_is_array ? right_key_node : left_key_node;
+
+                /// Extract element type from Array(T)
+                const auto * array_type = typeid_cast<const DataTypeArray *>(array_key_node->result_type.get());
+                if (!array_type)
+                {
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "JOIN {} array join key {} should have Array type but has type {}",
+                        join_node.formatASTForErrorMessage(),
+                        array_key_node->result_name,
+                        array_key_node->result_type->getName());
+                }
+
+                const auto & element_type = array_type->getNestedType();
+
+                /// Find common type between array element type and scalar type
+                if (!element_type->equals(*scalar_key_node->result_type))
+                {
+                    DataTypePtr common_type;
+
+                    try
+                    {
+                        common_type = getLeastSupertype(DataTypes{element_type, scalar_key_node->result_type});
+                    }
+                    catch (Exception & ex)
+                    {
+                        ex.addMessage("JOIN {} cannot infer common type in ON section for array join keys. Array element type {}. Scalar key {} type {}",
+                            join_node.formatASTForErrorMessage(),
+                            element_type->getName(),
+                            scalar_key_node->result_name,
+                            scalar_key_node->result_type->getName());
+                        throw;
+                    }
+
+                    /// Cast array to Array(common_type) if element type differs
+                    if (!element_type->equals(*common_type))
+                    {
+                        auto target_array_type = std::make_shared<DataTypeArray>(common_type);
+                        if (left_is_array)
+                            left_key_node = &left_join_actions.addCast(*array_key_node, target_array_type, {});
+                        else
+                            right_key_node = &right_join_actions.addCast(*array_key_node, target_array_type, {});
+                    }
+
+                    /// Cast scalar to common_type if needed
+                    if (!scalar_key_node->result_type->equals(*common_type))
+                    {
+                        if (left_is_array)
+                            right_key_node = &right_join_actions.addCast(*scalar_key_node, common_type, {});
+                        else
+                            left_key_node = &left_join_actions.addCast(*scalar_key_node, common_type, {});
+                    }
+                }
+            }
+            else if (!left_key_node->result_type->equals(*right_key_node->result_type))
             {
                 DataTypePtr common_type;
 

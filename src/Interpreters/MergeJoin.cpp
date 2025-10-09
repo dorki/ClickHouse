@@ -546,7 +546,7 @@ MergeJoin::MergeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_
     key_names_right.insert(key_names_right.end(), onexpr.key_names_right.begin(), onexpr.key_names_right.end());
 
     addConditionJoinColumn(right_sample_block, JoinTableSide::Right);
-    JoinCommon::splitAdditionalColumns(key_names_right, right_sample_block, right_table_keys, right_columns_to_add);
+    JoinCommon::splitAdditionalColumns(key_names_right, right_sample_block, right_table_keys, right_columns_to_add, table_join.get());
 
     const NameSet required_right_keys = table_join->requiredRightKeys();
     for (const auto & right_key : key_names_right)

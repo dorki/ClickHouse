@@ -176,7 +176,7 @@ HashJoin::HashJoin(
     else if (table_join->oneDisjunct())
     {
         const auto & key_names_right = table_join->getOnlyClause().key_names_right;
-        JoinCommon::splitAdditionalColumns(key_names_right, right_sample_block, right_table_keys, sample_block_with_columns_to_add);
+        JoinCommon::splitAdditionalColumns(key_names_right, right_sample_block, right_table_keys, sample_block_with_columns_to_add, table_join.get());
         required_right_keys = table_join->getRequiredRightKeys(right_table_keys, required_right_keys_sources);
     }
     else
@@ -594,7 +594,7 @@ bool HashJoin::addBlockToJoin(const Block & source_block, bool check_limits)
     return addBlockToJoin(materialized, ScatteredBlock::Selector(materialized.rows()), check_limits);
 }
 
-bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits)
+bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector selector, bool check_limits, size_t current_slot_id, size_t total_slots)
 {
     if (!data)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Join data was released");
@@ -770,7 +770,9 @@ bool HashJoin::addBlockToJoin(const Block & block, ScatteredBlock::Selector sele
                             join_mask_col,
                             data->pool,
                             is_inserted,
-                            all_values_unique);
+                            all_values_unique,
+                            current_slot_id,
+                            total_slots);
 
                         if (flag_per_row)
                             used_flags->reinit<kind_, strictness_, std::is_same_v<std::decay_t<decltype(map)>, MapsAll>>(&stored_columns->columns);
@@ -1112,7 +1114,7 @@ void HashJoin::checkTypesOfKeys(const Block & block) const
 {
     for (const auto & onexpr : table_join->getClauses())
     {
-        JoinCommon::checkTypesOfKeys(block, onexpr.key_names_left, right_table_keys, onexpr.key_names_right);
+        JoinCommon::checkTypesOfKeys(block, onexpr.key_names_left, right_table_keys, onexpr.key_names_right, &onexpr.array_join_key_indexes);
     }
 }
 
@@ -1125,7 +1127,7 @@ JoinResultPtr HashJoin::joinBlock(Block block)
     {
         auto cond_column_name = onexpr.condColumnNames();
         JoinCommon::checkTypesOfKeys(
-            block, onexpr.key_names_left, cond_column_name.first, right_sample_block, onexpr.key_names_right, cond_column_name.second);
+            block, onexpr.key_names_left, cond_column_name.first, right_sample_block, onexpr.key_names_right, cond_column_name.second, &onexpr.array_join_key_indexes);
     }
 
     if (kind == JoinKind::Cross || kind == JoinKind::Comma)
@@ -1193,7 +1195,8 @@ JoinResultPtr HashJoin::joinScatteredBlock(ScatteredBlock block)
             cond_column_name.first,
             right_sample_block,
             onexpr.key_names_right,
-            cond_column_name.second);
+            cond_column_name.second,
+            &onexpr.array_join_key_indexes);
     }
 
     std::vector<const std::decay_t<decltype(data->maps[0])> *> maps_vector;

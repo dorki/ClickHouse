@@ -5,13 +5,16 @@
 #include <Columns/ColumnSparse.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/FilterDescription.h>
+#include <Columns/ColumnArray.h>
 
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/TableJoin.h>
+#include <Interpreters/HashJoin/ArrayJoinDispatch.h>
 
 #include <IO/WriteHelpers.h>
 
@@ -389,7 +392,8 @@ ColumnRawPtrs extractKeysForJoin(const Block & block_keys, const Names & key_nam
 }
 
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
-                      const Block & block_right, const Names & key_names_right)
+                      const Block & block_right, const Names & key_names_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes)
 {
     size_t keys_size = key_names_left.size();
 
@@ -397,6 +401,28 @@ void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
     {
         DataTypePtr left_type = removeNullable(recursiveRemoveLowCardinality(block_left.getByName(key_names_left[i]).type));
         DataTypePtr right_type = removeNullable(recursiveRemoveLowCardinality(block_right.getByName(key_names_right[i]).type));
+
+        /// For array join keys, extract element type from array side for comparison
+        if (array_join_key_indexes && array_join_key_indexes->contains(i))
+        {
+            auto it = array_join_key_indexes->find(i);
+            bool left_is_array = it->second;
+
+            if (left_is_array)
+            {
+                /// Left is array, extract element type
+                const auto * array_type = typeid_cast<const DataTypeArray *>(left_type.get());
+                if (array_type)
+                    left_type = removeNullable(recursiveRemoveLowCardinality(array_type->getNestedType()));
+            }
+            else
+            {
+                /// Right is array, extract element type
+                const auto * array_type = typeid_cast<const DataTypeArray *>(right_type.get());
+                if (array_type)
+                    right_type = removeNullable(recursiveRemoveLowCardinality(array_type->getNestedType()));
+            }
+        }
 
         if (!left_type->equals(*right_type))
         {
@@ -410,9 +436,10 @@ void checkTypesOfKeys(const Block & block_left, const Names & key_names_left,
 }
 
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left, const String & condition_name_left,
-                      const Block & block_right, const Names & key_names_right, const String & condition_name_right)
+                      const Block & block_right, const Names & key_names_right, const String & condition_name_right,
+                      const std::unordered_map<size_t, bool> * array_join_key_indexes)
 {
-    checkTypesOfKeys(block_left, key_names_left, block_right, key_names_right);
+    checkTypesOfKeys(block_left, key_names_left, block_right, key_names_right, array_join_key_indexes);
     checkTypesOfMasks(block_left, condition_name_left, block_right, condition_name_right);
 }
 
@@ -532,18 +559,32 @@ JoinMask getColumnAsMask(const Block & block, const String & column_name)
 }
 
 
-void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others)
+void splitAdditionalColumns(const Names & key_names, const Block & sample_block, Block & block_keys, Block & block_others, const TableJoin * table_join)
 {
     block_others = materializeBlock(sample_block);
 
-    for (const String & column_name : key_names)
+    for (size_t i = 0; i < key_names.size(); ++i)
     {
+        const String & column_name = key_names[i];
+
+        /// Check if this is an array join key
+        bool is_array_join_key = false;
+        if (table_join && table_join->oneDisjunct())
+        {
+            const auto & clause = table_join->getOnlyClause();
+            is_array_join_key = clause.isArrayJoinKey(i);
+        }
+
         /// Extract right keys with correct keys order. There could be the same key names.
         if (!block_keys.has(column_name))
         {
             auto & col = block_others.getByName(column_name);
             block_keys.insert(col);
-            block_others.erase(column_name);
+
+            /// For array join keys, keep them in block_others so they're fetched from hash table
+            /// For regular keys, remove them from block_others (they'll be copied from left)
+            if (!is_array_join_key)
+                block_others.erase(column_name);
         }
     }
 }
@@ -644,6 +685,185 @@ Blocks scatterBlockByHash(const Strings & key_columns_names, const Blocks & bloc
 Blocks scatterBlockByHash(const Strings & key_columns_names, const BlocksList & blocks, size_t num_shards)
 {
     return scatterBlockByHashForList(key_columns_names, blocks, num_shards);
+}
+
+/// Array-aware variant for joins with array keys
+Blocks scatterBlockByHash(const Strings & key_columns_names, const Block & block, size_t num_shards, const TableJoin & table_join, JoinTableSide side)
+{
+    if (num_shards == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Number of shards must be positive");
+
+    /// Check if we have array join keys
+    if (!ArrayJoinDispatch::hasArrayJoinKeys(key_columns_names, table_join, side))
+    {
+        /// No array keys, use standard scattering
+        return scatterBlockByHash(key_columns_names, block, num_shards);
+    }
+
+    /// We have array keys, use array-aware dispatch
+    /// Create a shard function that uses WeakHash32 and returns the final shard number
+    auto shard_func = [num_shards](const ColumnRawPtrs & key_columns, size_t row_idx) -> size_t
+    {
+        /// Use non-standard initial value so as not to degrade hash map performance inside shard that uses the same CRC32 algorithm.
+        WeakHash32 hash(1);
+
+        /// For a single row, we need to compute hash based on the key columns at that row
+        /// We'll extract just that one row to compute the hash
+        for (const auto * col : key_columns)
+        {
+            /// Create a temporary column with just this row
+            auto temp_col = col->cloneEmpty();
+            temp_col->insertFrom(*col, row_idx);
+            hash.update(temp_col->getWeakHash32());
+        }
+
+        size_t raw_hash = hash.getData()[0];
+
+        /// For grace hash, we use simple masking (no getBucketFromHash)
+        /// This matches the scatterBlockByHashPow2 logic
+        if (isPowerOf2(num_shards))
+            return raw_hash & (num_shards - 1);
+        else
+            return raw_hash % num_shards;
+    };
+
+    /// Get the selector using array-aware logic
+    IColumn::Selector selector = ArrayJoinDispatch::createArrayAwareSelector(
+        block,
+        key_columns_names,
+        table_join,
+        side,
+        num_shards,
+        shard_func);
+
+    /// Now scatter the block according to the selector
+    /// Note: selector may have more entries than block.rows() due to row duplication
+    Blocks result;
+    result.reserve(num_shards);
+    for (size_t i = 0; i < num_shards; ++i)
+        result.emplace_back(block.cloneEmpty());
+
+    /// We need to handle the case where selector has duplicates (rows sent to multiple shards)
+    /// Build a mapping from shard to list of row indices
+    std::vector<std::vector<size_t>> shard_to_rows(num_shards);
+    for (size_t selector_idx = 0; selector_idx < selector.size(); ++selector_idx)
+    {
+        size_t shard = selector[selector_idx];
+        shard_to_rows[shard].push_back(selector_idx % block.rows()); // Map back to original row
+    }
+
+    /// Actually, the selector returned by createArrayAwareSelector has one entry per output row
+    /// and the selector value indicates which shard it goes to
+    /// But we need to track which original input row each selector entry corresponds to
+
+    /// Let me reconsider: the selector from createArrayAwareSelector duplicates entries
+    /// for rows that go to multiple shards. We need to map selector entries back to source rows.
+
+    /// Actually, looking at the implementation, for array-aware dispatch:
+    /// - Each selector entry corresponds to sending one row to one shard
+    /// - Multiple selector entries can refer to the same source row (for multi-shard arrays)
+    /// - We need to track which source row each selector entry represents
+
+    /// The createArrayAwareRowSelector function creates selector entries in order,
+    /// processing rows 0, 1, 2, ... and for each row adding one or more shard entries.
+    /// So we need to reconstruct which source row each selector entry came from.
+
+    /// Rebuild the source row mapping
+    const auto & clauses = table_join.getClauses();
+    if (clauses.empty())
+    {
+        /// Simple case: no arrays, selector has one entry per row
+        for (size_t i = 0; i < block.columns(); ++i)
+        {
+            auto dispatched_columns = block.getByPosition(i).column->scatter(num_shards, selector);
+            for (size_t shard = 0; shard < num_shards; ++shard)
+                result[shard].getByPosition(i).column = std::move(dispatched_columns[shard]);
+        }
+        return result;
+    }
+
+    /// Extract array column info to determine row mapping
+    ColumnRawPtrs key_columns;
+    for (const auto & key_name : key_columns_names)
+        key_columns.push_back(block.getByName(key_name).column.get());
+
+    const auto & clause = clauses[0];
+    ssize_t array_key_index = ArrayJoinDispatch::findArrayKeyColumnIndex(key_columns, clause);
+
+    if (array_key_index < 0)
+    {
+        /// No array column found, use standard scatter
+        for (size_t i = 0; i < block.columns(); ++i)
+        {
+            auto dispatched_columns = block.getByPosition(i).column->scatter(num_shards, selector);
+            for (size_t shard = 0; shard < num_shards; ++shard)
+                result[shard].getByPosition(i).column = std::move(dispatched_columns[shard]);
+        }
+        return result;
+    }
+
+    /// Build source row mapping from selector
+    /// The selector from createArrayAwareRowSelector has entries in row order,
+    /// with multiple entries per row if the row goes to multiple shards
+    std::vector<size_t> selector_to_source_row;
+    selector_to_source_row.reserve(selector.size());
+
+    ArrayJoinDispatch::ArrayElementInfo array_info = ArrayJoinDispatch::extractArrayElementInfo(key_columns, array_key_index);
+    const auto & offsets = array_info.array_column->getOffsets();
+
+    /// Create expanded key columns with element column substituted
+    ColumnRawPtrs expanded_key_columns = key_columns;
+    expanded_key_columns[array_key_index] = array_info.element_column;
+
+    /// Recreate the logic from createArrayAwareRowSelector to map selector entries to source rows
+    for (size_t row = 0; row < block.rows(); ++row)
+    {
+        size_t array_start = row == 0 ? 0 : offsets[row - 1];
+        size_t array_end = offsets[row];
+
+        /// Count non-NULL elements and their shards
+        std::set<size_t> shards_for_row;
+        for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+        {
+            if (array_info.element_null_map && (*array_info.element_null_map)[elem_idx])
+                continue;
+
+            /// Use expanded key columns (with elements) to calculate shard
+            size_t shard = shard_func(expanded_key_columns, elem_idx);
+            shards_for_row.insert(shard);
+        }
+
+        /// Each unique shard gets one selector entry pointing to this source row
+        size_t entries_for_this_row = shards_for_row.empty() ? 1 : shards_for_row.size();
+        for (size_t i = 0; i < entries_for_this_row; ++i)
+            selector_to_source_row.push_back(row);
+    }
+
+    /// Now scatter based on selector and source row mapping
+    for (size_t col_idx = 0; col_idx < block.columns(); ++col_idx)
+    {
+        const auto & source_column = block.getByPosition(col_idx).column;
+
+        /// For each shard, collect rows
+        for (size_t shard = 0; shard < num_shards; ++shard)
+        {
+            auto & dest_column = result[shard].getByPosition(col_idx).column;
+            auto mut_column = dest_column->cloneEmpty();
+
+            for (size_t selector_idx = 0; selector_idx < selector.size(); ++selector_idx)
+            {
+                if (selector[selector_idx] == shard)
+                {
+                    size_t source_row = selector_to_source_row[selector_idx];
+                    mut_column->insertFrom(*source_column, source_row);
+                }
+            }
+
+            dest_column = std::move(mut_column);
+        }
+    }
+
+    return result;
 }
 
 bool hasNonJoinedBlocks(const TableJoin & table_join)

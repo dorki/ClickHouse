@@ -77,7 +77,9 @@ public:
         const JoinCommon::JoinMask & join_mask,
         Arena & pool,
         bool & is_inserted,
-        bool & all_values_unique);
+        bool & all_values_unique,
+        size_t current_slot_id = 0,
+        size_t total_slots = 1);
 
     using MapsTemplateVector = std::vector<const MapsTemplate *>;
 
@@ -111,7 +113,9 @@ private:
         const JoinCommon::JoinMask & join_mask,
         Arena & pool,
         bool & is_inserted,
-        bool & all_values_unique);
+        bool & all_values_unique,
+        size_t current_slot_id = 0,
+        size_t total_slots = 1);
 
     template <typename AddedColumns>
     static void switchJoinRightColumns(

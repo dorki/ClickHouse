@@ -1,6 +1,9 @@
 #pragma once
+#include <thread>
 
 #include <Columns/IColumn.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/HashJoin/AddedColumns.h>
 #include <Interpreters/HashJoin/HashJoinMethods.h>
@@ -8,6 +11,7 @@
 #include <Interpreters/JoinUtils.h>
 
 #include <algorithm>
+#include <sstream>
 #include <type_traits>
 
 namespace DB
@@ -16,6 +20,46 @@ namespace ErrorCodes
 {
 extern const int UNSUPPORTED_JOIN_KEYS;
 extern const int LOGICAL_ERROR;
+extern const int TYPE_MISMATCH;
+}
+
+namespace
+{
+    /// Concept to check if HashMap has getBucketFromHash method (for two-level hash tables)
+    template <typename HashTable>
+    concept HasGetBucketFromHashMemberFunc = requires {
+        { std::declval<HashTable>().getBucketFromHash(static_cast<size_t>(0)) };
+    };
+
+    /// Helper to check if any key column is an array during BUILD phase (right side for build)
+    /// Returns index of first array column, or -1 if none
+    ssize_t findArrayKeyColumn(const ColumnRawPtrs & key_columns, const TableJoin & table_join)
+    {
+        const auto & clauses = table_join.getClauses();
+        if (clauses.empty())
+            return -1;
+
+        const auto & clause = clauses[0];  /// For now, only support single clause
+        std::cerr << "[BUILD] Searching for array key among " << key_columns.size() << " key columns" << std::endl;
+        for (size_t i = 0; i < key_columns.size(); ++i)
+        {
+            std::cerr << "[BUILD] Key " << i << ": isArrayJoinKey=" << clause.isArrayJoinKey(i)
+                      << ", rightIsArray=" << clause.rightIsArray(i)
+                      << ", column type=" << key_columns[i]->getName() << std::endl;
+            if (clause.isArrayJoinKey(i))
+            {
+                /// Check if this is the array side (right side for build phase)
+                if (clause.rightIsArray(i))
+                {
+                    std::cerr << "[BUILD] Found array key at index " << i << std::endl;
+                    return static_cast<ssize_t>(i);
+                }
+            }
+        }
+        std::cerr << "[BUILD] No array key found" << std::endl;
+        return -1;
+    }
+
 }
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
 void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
@@ -30,7 +74,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
     const JoinCommon::JoinMask & join_mask,
     Arena & pool,
     bool & is_inserted,
-    bool & all_values_unique)
+    bool & all_values_unique,
+    size_t current_slot_id,
+    size_t total_slots)
 {
     switch (type)
     {
@@ -46,11 +92,11 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
         if (selector.isContinuousRange()) \
             insertFromBlockImplTypeCase< \
                 typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getRange(), null_map, join_mask, pool, is_inserted, all_values_unique); \
+                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getRange(), null_map, join_mask, pool, is_inserted, all_values_unique, current_slot_id, total_slots); \
         else \
             insertFromBlockImplTypeCase< \
                 typename KeyGetterForType<HashJoin::Type::TYPE, std::remove_reference_t<decltype(*maps.TYPE)>>::Type>( \
-                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getIndexes(), null_map, join_mask, pool, is_inserted, all_values_unique); \
+                join, *maps.TYPE, key_columns, key_sizes, stored_columns, selector.getIndexes(), null_map, join_mask, pool, is_inserted, all_values_unique, current_slot_id, total_slots); \
         break;
 
             APPLY_FOR_JOIN_VARIANTS(M)
@@ -136,16 +182,42 @@ template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
 template <typename KeyGetter, bool is_asof_join>
 KeyGetter HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::createKeyGetter(const ColumnRawPtrs & key_columns, const Sizes & key_sizes)
 {
+    /// Check if any key column is an array - if so, we need to extract element columns
+    /// Arrays are not contiguous memory, so we use their inner data column instead
+    ColumnRawPtrs adjusted_key_columns = key_columns;
+
+    for (size_t i = 0; i < key_columns.size(); ++i)
+    {
+        if (const auto * array_col = typeid_cast<const ColumnArray *>(key_columns[i]))
+        {
+            /// Replace array column with its data column (the flattened elements)
+            const IColumn * data_col = &array_col->getData();
+
+            /// If the data column is nullable, extract the nested column
+            /// ColumnNullable is also not contiguous (has nested column + null map)
+            if (const auto * nullable_col = typeid_cast<const ColumnNullable *>(data_col))
+            {
+                data_col = &nullable_col->getNestedColumn();
+                std::cerr << "[createKeyGetter] Array column at index " << i
+                          << " has nullable elements, using nested column" << std::endl;
+            }
+
+            adjusted_key_columns[i] = data_col;
+            std::cerr << "[createKeyGetter] Detected array column at index " << i
+                      << ", using element column instead" << std::endl;
+        }
+    }
+
     if constexpr (is_asof_join)
     {
-        auto key_column_copy = key_columns;
+        auto key_column_copy = adjusted_key_columns;
         auto key_size_copy = key_sizes;
         key_column_copy.pop_back();
         key_size_copy.pop_back();
         return KeyGetter(key_column_copy, key_size_copy, nullptr);
     }
     else
-        return KeyGetter(key_columns, key_sizes, nullptr);
+        return KeyGetter(adjusted_key_columns, key_sizes, nullptr);
 }
 
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
@@ -161,7 +233,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
     const JoinCommon::JoinMask & join_mask,
     Arena & pool,
     bool & is_inserted,
-    bool & all_values_unique)
+    bool & all_values_unique,
+    size_t current_slot_id,
+    size_t total_slots)
 {
     [[maybe_unused]] constexpr bool mapped_one = std::is_same_v<typename HashMap::mapped_type, RowRef>;
     constexpr bool is_asof_join = STRICTNESS == JoinStrictness::Asof;
@@ -180,6 +254,22 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
         rows = selector.getData().size();
     else
         rows = selector.second - selector.first;
+
+    /// Check if we have array join keys that need expansion
+    ssize_t array_key_index = findArrayKeyColumn(key_columns, *join.table_join);
+    const ColumnArray * array_column = nullptr;
+    if (array_key_index >= 0)
+    {
+        array_column = typeid_cast<const ColumnArray *>(key_columns[array_key_index]);
+        /// Array join expansion means the same right row can match multiple left rows
+        /// So values are NOT unique - this prevents RightAny promotion
+        // TEMPORARILY COMMENTED OUT FOR TESTING:
+        // all_values_unique = false;
+
+        /// Diagnostic logging for parallel_hash
+        std::thread::id this_id = std::this_thread::get_id();
+        std::cerr << "[BUILD] Array join detected on thread: " << this_id << std::endl;
+    }
 
     for (size_t i = 0; i < rows; ++i)
     {
@@ -202,13 +292,158 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
         if (join_mask.isRowFiltered(ind))
             continue;
 
-        if constexpr (is_asof_join)
-            Inserter<HashMap, KeyGetter>::insertAsof(join, map, key_getter, stored_columns, ind, pool, *asof_column);
-        else if constexpr (mapped_one)
-            is_inserted |= Inserter<HashMap, KeyGetter>::insertOne(join, map, key_getter, stored_columns, ind, pool);
+        /// Handle array join key expansion
+        if (array_column)
+        {
+            /// Get array elements for this row
+            const auto & offsets = array_column->getOffsets();
+            size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
+            size_t array_end = offsets[ind];
+
+            /// For each element in the array, insert a hash table entry with the element value
+            /// All entries point to the same row (ind) in stored_columns
+            const IColumn & array_data = array_column->getData();
+
+            /// Check if array elements are nullable
+            const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
+            const IColumn * element_column = nullable_array_data ? &nullable_array_data->getNestedColumn() : &array_data;
+            const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
+
+            /// Create temporary key columns with element column (not array) substituted
+            ColumnRawPtrs expanded_key_columns = key_columns;
+            expanded_key_columns[array_key_index] = element_column;
+
+            /// Create temporary key sizes (array data column has same size as array column's data)
+            Sizes expanded_key_sizes = key_sizes;
+
+            /// Create key getter once with expanded columns (element column instead of array)
+            auto elem_key_getter = createKeyGetter<KeyGetter, is_asof_join>(expanded_key_columns, expanded_key_sizes);
+
+            /// For each element in the array, compute hash and insert
+            for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+            {
+                /// Skip NULL elements in nullable arrays
+                if (element_null_map && (*element_null_map)[elem_idx])
+                {
+                    std::cerr << "[BUILD] Skipping NULL element at idx " << elem_idx << std::endl;
+                    continue;
+                }
+
+                /// Calculate hash for this element (needed for filtering)
+                size_t elem_hash = elem_key_getter.getHash(map, elem_idx, pool);
+
+                /// For parallel hash (multiple slots), check bucket ownership
+                /// Only filter if we're using two-level maps (requires both runtime and compile-time checks)
+                if constexpr (HasGetBucketFromHashMemberFunc<HashMap>)
+                {
+                    if (total_slots > 1 && join.twoLevelMapIsUsed())
+                    {
+                        size_t bucket = map.getBucketFromHash(elem_hash);
+                        size_t slot = bucket & (total_slots - 1);
+
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                                  << " hash=" << elem_hash << " bucket=" << bucket << " slot=" << slot << std::endl;
+
+                        if (slot != current_slot_id)
+                        {
+                            std::cerr << "[BUILD] Slot " << current_slot_id << " skipping element " << elem_idx
+                                      << " (belongs to slot " << slot << ")" << std::endl;
+                            continue;
+                        }
+
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " accepting element " << elem_idx << std::endl;
+                    }
+                    else if (total_slots > 1)
+                    {
+                        std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                                  << " (map not two-level yet, accepting all)" << std::endl;
+                    }
+                }
+                else if (total_slots > 1)
+                {
+                    std::cerr << "[BUILD] Slot " << current_slot_id << " element " << elem_idx
+                              << " (map type doesn't support two-level, accepting all)" << std::endl;
+                }
+
+                std::cerr << "[BUILD] Inserting element at idx " << elem_idx
+                          << ", value: " << (*element_column)[elem_idx].dump() << std::endl;
+
+                /// Extract key from array element position elem_idx
+                auto emplace_result = elem_key_getter.emplaceKey(map, elem_idx, pool);
+                std::thread::id this_id = std::this_thread::get_id();
+
+                std::cerr << "[BUILD] Emplaced element, isInserted=" << emplace_result.isInserted()
+                            << ", thread: " << this_id
+                          << ", map.size()=" << map.size() << std::endl;
+
+                /// Store reference to original row (ind), not the element position
+                if constexpr (is_asof_join)
+                {
+                    typename HashMap::mapped_type * time_series_map = &emplace_result.getMapped();
+                    TypeIndex asof_type = *join.getAsofType();
+                    if (emplace_result.isInserted())
+                        time_series_map = new (time_series_map) typename HashMap::mapped_type(createAsofRowRef(asof_type, join.getAsofInequality()));
+                    (*time_series_map)->insert(*asof_column, stored_columns, ind);
+                    is_inserted |= emplace_result.isInserted();
+                }
+                else if constexpr (mapped_one)
+                {
+                    if (emplace_result.isInserted() || join.anyTakeLastRow())
+                    {
+                        new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                        is_inserted = true;
+                    }
+                }
+                else
+                {
+                    if (emplace_result.isInserted())
+                    {
+                        new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                    }
+                    else
+                    {
+                        /// Key already exists - only add row reference if this row (ind) isn't already in the list
+                        /// This handles duplicate values within the same array: [1, 1, 1, 1]
+                        auto & existing_rows = emplace_result.getMapped();
+                        bool row_already_added = false;
+
+                        /// Check if row 'ind' is already in the list
+                        for (auto it = existing_rows.begin(); it.ok(); ++it)
+                        {
+                            if (it->row_num == ind)
+                            {
+                                row_already_added = true;
+                                std::cerr << "[BUILD] Skipping duplicate: row " << ind << " already added for this key" << std::endl;
+                                break;
+                            }
+                        }
+
+                        if (!row_already_added)
+                        {
+                            existing_rows.insert({stored_columns, ind}, pool);
+                        }
+                    }
+                    /// Don't update all_values_unique here for array joins - we already set it to false
+                    all_values_unique &= emplace_result.isInserted();
+                }
+            }
+        }
         else
-            all_values_unique &= Inserter<HashMap, KeyGetter>::insertAll(join, map, key_getter, stored_columns, ind, pool);
+        {
+            /// Normal non-array join
+            if constexpr (is_asof_join)
+                Inserter<HashMap, KeyGetter>::insertAsof(join, map, key_getter, stored_columns, ind, pool, *asof_column);
+            else if constexpr (mapped_one)
+                is_inserted |= Inserter<HashMap, KeyGetter>::insertOne(join, map, key_getter, stored_columns, ind, pool);
+            else
+                all_values_unique &= Inserter<HashMap, KeyGetter>::insertAll(join, map, key_getter, stored_columns, ind, pool);
+        }
     }
+
+    std::thread::id this_id = std::this_thread::get_id();
+
+    std::cerr << "[BUILD] Completed insertions. Hash table size: " << map.size() << ", thread: " << this_id
+              << ", all_values_unique=" << all_values_unique << std::endl;
 }
 
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
@@ -220,6 +455,9 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::switchJoinRightColumns(
     HashJoin::Type type,
     JoinStuff::JoinUsedFlags & used_flags)
 {
+    /// Array columns are now handled in createKeyGetter() which extracts element columns
+    /// The actual array expansion logic is in joinRightColumns() probing code
+
     constexpr bool is_asof_join = STRICTNESS == JoinStrictness::Asof;
     switch (type)
     {
@@ -409,7 +647,9 @@ void processMatch(
         setUsed<need_filter>(added_columns.filter, i, added_columns.matched_rows);
         used_flags.template setUsed<join_features.need_flags, flag_per_row>(find_result);
         auto used_flags_opt = join_features.need_flags ? &used_flags : nullptr;
+        std::cerr << "[PROBE] About to call addFoundRowAll, current_offset=" << current_offset << std::endl;
         addFoundRowAll<Map, join_features.add_missing>(mapped, added_columns, current_offset, known_rows, used_flags_opt);
+        std::cerr << "[PROBE] After addFoundRowAll, current_offset=" << current_offset << std::endl;
     }
     else if constexpr ((join_features.is_any_join || join_features.is_semi_join) && join_features.right)
     {
@@ -507,14 +747,104 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
             else
                 row_acceptable = !join_keys.isRowFiltered(ind);
 
-            using FindResult = typename KeyGetter::FindResult;
-            auto find_result = row_acceptable ? key_getter.findKey(*map, ind, pool) : FindResult();
+            /// Check if any key column is an array - if so, we need array-aware probing
+            /// Skip this for KeyGetterEmpty (used for EMPTY/CROSS joins with no keys)
+            constexpr bool is_key_getter_empty = std::is_same_v<KeyGetter, KeyGetterEmpty<typename MapsTemplate::MappedType>>;
+            ssize_t array_key_idx = -1;
 
-            if (find_result.isFound())
+            if constexpr (!is_key_getter_empty)
             {
-                right_row_found = true;
-                processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
-                    find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                for (size_t key_idx = 0; key_idx < join_keys.key_columns.size(); ++key_idx)
+                {
+                    if (const auto * array_col = typeid_cast<const ColumnArray *>(join_keys.key_columns[key_idx]))
+                    {
+                        array_key_idx = static_cast<ssize_t>(key_idx);
+                        std::cerr << "[PROBE] Found array column at key index " << key_idx << std::endl;
+                        break;
+                    }
+                }
+            }
+
+            /// Array expansion block - only compile for non-empty KeyGetters
+            bool array_processed = false;
+            if constexpr (!is_key_getter_empty)
+            {
+                if (array_key_idx >= 0 && row_acceptable)
+                {
+                    array_processed = true;
+                    /// Array-aware probing: expand array and probe each element
+                    /// Note: key_getter was already created with element columns by createKeyGetter()
+                    const auto * array_column = typeid_cast<const ColumnArray *>(join_keys.key_columns[array_key_idx]);
+                    const auto & offsets = array_column->getOffsets();
+                    size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
+                    size_t array_end = offsets[ind];
+
+                    std::cerr << "[PROBE] Row " << ind << ": Array has " << (array_end - array_start) << " elements" << std::endl;
+
+                    /// Check for NULL elements in the array data
+                    const IColumn & array_data = array_column->getData();
+                    const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
+                    const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
+
+                    /// Probe each array element using the existing key_getter
+                    /// key_getter was created with element columns, so we use element indices
+                    for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+                    {
+                        /// Skip NULL elements
+                        if (element_null_map && (*element_null_map)[elem_idx])
+                        {
+                            std::cerr << "[PROBE] Skipping NULL element at idx " << elem_idx << std::endl;
+                            continue;
+                        }
+
+                        /// Use the existing key_getter which already has element columns
+                        auto find_result = key_getter.findKey(*map, elem_idx, pool);
+
+                        if (elem_idx - array_start < 3)
+                        {
+                            std::cerr << "[PROBE] Element " << (elem_idx - array_start) << " at idx " << elem_idx
+                                      << ": found=" << find_result.isFound()
+                                      << ", value=" << array_data[elem_idx].dump() << std::endl;
+                        }
+
+                        if (find_result.isFound())
+                        {
+                            right_row_found = true;
+                            std::cerr << "[PROBE] Element match found, processing..." << std::endl;
+                            processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                                find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                        }
+                    }
+                }
+            }
+
+            if (!array_processed)
+            {
+                /// Normal non-array probing (for KeyGetterEmpty or when no array key is found)
+                using FindResult = typename KeyGetter::FindResult;
+                auto find_result = row_acceptable ? key_getter.findKey(*map, ind, pool) : FindResult();
+
+                if (ind < 3)
+                {
+                    std::cerr << "[PROBE] Row " << ind << " (i=" << i << "): row_acceptable=" << row_acceptable
+                              << ", found=" << find_result.isFound();
+                    if (join_keys.key_columns.size() > 0 && join_keys.key_columns[0] && ind < join_keys.key_columns[0]->size())
+                        std::cerr << ", looking for value=" << (*join_keys.key_columns[0])[ind].dump();
+                    std::cerr << std::endl;
+                }
+
+                if (find_result.isFound())
+                {
+                    right_row_found = true;
+                    if (ind < 3)
+                        std::cerr << "[PROBE] Row " << ind << ": Processing match, current_offset before=" << current_offset
+                                  << ", added_columns.size before=" << added_columns.size() << std::endl;
+                    processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                        find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                    if (ind < 3)
+                        std::cerr << "[PROBE] Row " << ind << ": After processMatch, current_offset after=" << current_offset
+                                  << ", added_columns.size after=" << added_columns.size() << std::endl;
+                }
             }
         }
 
@@ -532,6 +862,7 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
     }
 
     added_columns.applyLazyDefaults();
+    std::cerr << "[PROBE] Finished processing all rows. added_columns has " << added_columns.size() << " rows" << std::endl;
 }
 
 template <JoinKind KIND, JoinStrictness STRICTNESS, typename MapsTemplate>
