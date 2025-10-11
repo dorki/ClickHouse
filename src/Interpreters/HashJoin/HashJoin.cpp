@@ -200,6 +200,14 @@ HashJoin::HashJoin(
         const auto & key_names_right = clause.key_names_right;
         ColumnRawPtrs key_columns = JoinCommon::extractKeysForJoin(right_table_keys, key_names_right);
 
+        /// Check if this clause has array join keys
+        /// Array joins produce multiple output rows per left row (one per matching array element)
+        /// This breaks RightAny assumption of "one left row → one output row max"
+        if (clause.hasArrayJoinKeys())
+        {
+            all_values_unique = false;
+        }
+
         if (strictness == JoinStrictness::Asof)
         {
             assert(disjuncts_num == 1);

@@ -249,8 +249,8 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
     if (array_key_index >= 0)
     {
         array_column = typeid_cast<const ColumnArray *>(key_columns[array_key_index]);
-        /// Array join expansion means the same right row can match multiple left rows
-        /// So values are NOT unique - this prevents RightAny promotion
+        /// Array joins produce multiple output rows per left row (one per matching array element)
+        /// This breaks RightAny assumption of "one left row → one output row max"
         all_values_unique = false;
     }
 
@@ -301,6 +301,10 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
 
             /// Create key getter once with expanded columns (element column instead of array)
             auto elem_key_getter = createKeyGetter<KeyGetter, is_asof_join>(expanded_key_columns, expanded_key_sizes);
+
+            /// Track which hashes from this row's array we've already inserted
+            /// This avoids O(N) linear search through existing_rows for duplicates like [1,1,1,1]
+            std::unordered_set<size_t> inserted_hashes_for_this_row;
 
             /// For each element in the array, compute hash and insert
             for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
@@ -356,28 +360,20 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                     if (emplace_result.isInserted())
                     {
                         new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
+                        inserted_hashes_for_this_row.insert(elem_hash);
                     }
                     else
                     {
-                        /// Key already exists - only add row reference if this row (ind) isn't already in the list
+                        /// Key already exists - check if we've already added this row for this hash
                         /// This handles duplicate values within the same array: [1, 1, 1, 1]
-                        auto & existing_rows = emplace_result.getMapped();
-                        bool row_already_added = false;
-
-                        /// Check if row 'ind' is already in the list
-                        for (auto it = existing_rows.begin(); it.ok(); ++it)
+                        if (inserted_hashes_for_this_row.find(elem_hash) == inserted_hashes_for_this_row.end())
                         {
-                            if (it->row_num == ind)
-                            {
-                                row_already_added = true;
-                                break;
-                            }
-                        }
-
-                        if (!row_already_added)
-                        {
+                            /// First time seeing this hash for this row - add it
+                            auto & existing_rows = emplace_result.getMapped();
                             existing_rows.insert({stored_columns, ind}, pool);
+                            inserted_hashes_for_this_row.insert(elem_hash);
                         }
+                        /// else: duplicate hash within same array [1,1,1,1] - skip
                     }
                     /// Don't update all_values_unique here for array joins - we already set it to false
                     all_values_unique &= emplace_result.isInserted();

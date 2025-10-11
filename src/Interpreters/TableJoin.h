@@ -104,6 +104,11 @@ public:
             return array_join_key_indexes.contains(key_index);
         }
 
+        bool hasArrayJoinKeys() const
+        {
+            return !array_join_key_indexes.empty();
+        }
+
         bool leftIsArray(size_t key_index) const
         {
             auto it = array_join_key_indexes.find(key_index);
