@@ -1146,7 +1146,6 @@ class SettingsRandomizer:
         "use_query_condition_cache": lambda: random.randint(0, 1),
         "secondary_indices_enable_bulk_filtering": lambda: random.randint(0, 1),
         "use_skip_indexes_if_final": lambda: random.randint(0, 1),
-        "use_skip_indexes_on_data_read": lambda: random.randint(0, 1),
         **randomize_external_sort_group_by(),
     }
 
@@ -1220,15 +1219,7 @@ class MergeTreeSettingsRandomizer:
         "enable_block_number_column": lambda: random.randint(0, 1),
         "enable_block_offset_column": lambda: random.randint(0, 1),
         "use_primary_key_cache": lambda: random.randint(0, 1),
-        "prewarm_primary_key_cache": lambda: random.randint(0, 1),
-        "object_serialization_version": lambda: random.choice(["v2", "v3"]),
-        "object_shared_data_serialization_version": lambda: random.choice(
-            ["map", "map_with_buckets", "advanced"]),
-        "object_shared_data_serialization_version_for_zero_level_parts": lambda: random.choice(
-            ["map", "map_with_buckets", "advanced"]),
-        "object_shared_data_buckets_for_compact_part": lambda: random.randint(1, 32),
-        "object_shared_data_buckets_for_wide_part": lambda: random.randint(1, 32),
-        "dynamic_serialization_version": lambda: random.choice(["v2", "v3"]),
+        "prewarm_primary_key_cache": lambda: random.randint(0, 1)
     }
 
     @staticmethod

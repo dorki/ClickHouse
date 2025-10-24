@@ -1,0 +1,164 @@
+Test 1: INNER JOIN hash
+Admins	Alice	admin
+Admins	Bob	user
+Everyone	Alice	admin
+Everyone	Bob	user
+Everyone	Charlie	moderator
+Everyone	David	admin
+Everyone	Eve	user
+Moderators	Alice	admin
+Moderators	Charlie	moderator
+Moderators	David	admin
+SingleUser	Eve	user
+Users	Bob	user
+Users	Charlie	moderator
+Test 2: INNER JOIN parallel_hash
+Admins	Alice	admin
+Admins	Bob	user
+Everyone	Alice	admin
+Everyone	Bob	user
+Everyone	Charlie	moderator
+Everyone	David	admin
+Everyone	Eve	user
+Moderators	Alice	admin
+Moderators	Charlie	moderator
+Moderators	David	admin
+SingleUser	Eve	user
+Users	Bob	user
+Users	Charlie	moderator
+Test 3: LEFT JOIN hash
+Admins	Alice
+Admins	Bob
+Empty	
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+NoMatch	
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 4: LEFT JOIN parallel_hash
+Admins	Alice
+Admins	Bob
+Empty	
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+NoMatch	
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 5: RIGHT JOIN hash
+	Empty
+	NoMatch
+Alice	Admins
+Alice	Everyone
+Alice	Moderators
+Bob	Admins
+Bob	Everyone
+Bob	Users
+Charlie	Everyone
+Charlie	Moderators
+Charlie	Users
+David	Everyone
+David	Moderators
+Eve	Everyone
+Eve	SingleUser
+Test 6: Composite conditions
+Admins	Alice	admin
+Everyone	Alice	admin
+Everyone	David	admin
+Moderators	Alice	admin
+Moderators	David	admin
+Test 7: Multiple predicates
+Admins	Alice	100.5
+Everyone	Alice	100.5
+Everyone	Charlie	75.8
+Everyone	David	95.3
+Moderators	Alice	100.5
+Moderators	Charlie	75.8
+Moderators	David	95.3
+Test 8: Aggregations
+Admins	2	75.35
+Everyone	5	76.38000000000001
+Moderators	3	90.53333333333335
+SingleUser	1	60.1
+Users	2	63
+Test 9: Subquery
+Admins	['Alice','Bob']
+Everyone	['Alice','Bob','Charlie','David','Eve']
+Moderators	['Alice','Charlie','David']
+SingleUser	['Eve']
+Users	['Bob','Charlie']
+Test 10: Old analyzer hash
+Admins	Alice
+Admins	Bob
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 11: Old analyzer parallel_hash
+Admins	Alice
+Admins	Bob
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 12: Empty arrays behavior
+Empty	0
+Everyone	5
+NoMatch	0
+Test 13: Large scale hash
+5272	4100
+Test 14: Large scale parallel_hash
+5272	4100
+Test 15: Large scale grace_hash
+5272	4100
+Test 16: Edge cases verification
+Duplicates	1
+HighIds	5
+Sequential	10
+Sparse	6
+Test 17: Partition pruning
+16
+Test 18: Aggregation by status
+active	1757	478
+inactive	1760	478
+pending	1755	479
+Test 19: PREWHERE optimization
+1757
+Test 20: Analyzer comparison - sample
+Group_499	User_1
+Sequential	User_1
+Sparse	User_1
+Group_10	User_100
+Sparse	User_100
+Duplicates	User_500
+Group_50	User_500
+Group_100	User_1000
+Group_99	User_1000
+Sparse	User_1000

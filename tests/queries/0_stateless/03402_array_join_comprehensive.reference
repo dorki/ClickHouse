@@ -1,0 +1,232 @@
+Test 1: INNER JOIN - array on right
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Eve	Banana
+Test 2: INNER JOIN - array on left
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 3: LEFT JOIN - array on right
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	
+Eve	Banana
+Test 4: LEFT JOIN - array on left
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 5: RIGHT JOIN - array on right
+	Date
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Eve	Banana
+Test 6: RIGHT JOIN - array on left
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 7: FULL JOIN - array on right
+	Date
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	
+Eve	Banana
+Test 8: FULL JOIN - array on left
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 9: Array on left with constant filter - INNER
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 10: Array on right with constant filter - LEFT
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Charlie	
+David	
+Eve	Banana
+Test 11: OR condition - both array joins
+Alice	Apple
+Alice	Banana
+Alice	Cherry
+Bob	Banana
+Bob	Cherry
+Bob	Date
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Eve	Elderberry
+Test 12: Mixed AND/OR - array + scalar
+Alice	Banana
+Bob	Banana
+Eve	Banana
+Test 13: Empty arrays behavior - RIGHT JOIN
+	Date
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Eve	Banana
+Test 14: Empty arrays on left - LEFT JOIN
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 15: Duplicate array values - INNER
+Alice	Apple	1
+Alice	Banana	1
+Alice	Cherry	1
+Alice	Date	1
+Alice	Elderberry	1
+Bob	Apple	1
+Bob	Banana	1
+Bob	Cherry	1
+Bob	Date	1
+Bob	Elderberry	1
+Eve	Apple	1
+Eve	Banana	1
+Eve	Cherry	1
+Eve	Date	1
+Eve	Elderberry	1
+Test 16: Three-way join - array in middle
+Test 17: Three-way join - arrays in first and last
+Alice	Label_A	Apple
+Alice	Label_A	Banana
+Bob	Label_B	Apple
+Bob	Label_B	Banana
+Bob	Label_B	Cherry
+Eve	Label_E	Banana
+Test 18: Self-join with arrays
+Alice	Bob
+Alice	Eve
+Bob	Eve
+Test 19: Subquery with array join
+Alice	2
+Bob	2
+David	1
+Eve	3
+Test 20: FULL JOIN with empty arrays
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+Charlie	
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 21: Parallel hash - complex case
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 22: RIGHT JOIN with parallel_hash
+	Date
+	Elderberry
+Alice	Apple
+Alice	Banana
+Bob	Apple
+Bob	Banana
+Bob	Cherry
+Eve	Banana
+Test 23: Array on left + WHERE filter
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+David	Date
+Eve	Banana
+Eve	Cherry
+Test 24: Array on right + aggregation
+Apple	2
+Banana	3
+Cherry	1
+Test 25: Chained - INNER(array) then LEFT(scalar)
+Alice	Label_A	
+Alice	Label_E	
+Bob	Label_B	
+Bob	Label_E	
+David	Label_A	
+Eve	Label_A	
+Eve	Label_E	
+Test 26: Chained - LEFT(scalar) then RIGHT(array)
+		Date
+		Elderberry
+Alice	Label_A	Apple
+Alice	Label_A	Banana
+Bob	Label_B	Apple
+Bob	Label_B	Banana
+Bob	Label_B	Cherry
+Eve	Label_E	Banana
+Test 27: Multiple array checks with AND
+Alice	Apple
+Alice	Banana
+Eve	Apple
+Eve	Banana
+Eve	Cherry
+Test 28: Grace hash with array join
+Alice	Apple
+Alice	Banana
+Bob	Banana
+Bob	Cherry
+David	Date
+Eve	Apple
+Eve	Banana
+Eve	Cherry

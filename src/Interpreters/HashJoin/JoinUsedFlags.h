@@ -64,6 +64,9 @@ public:
         return !need_flags;
     }
 
+    /// Check if this JoinUsedFlags was initialized with row-based tracking
+    bool isPerRowMode() const { return !per_row_flags.empty(); }
+
     template <bool use_flags, bool flag_per_row, typename FindResult>
     void setUsed(const FindResult & f)
     {

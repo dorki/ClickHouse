@@ -1,0 +1,76 @@
+Test 1: INNER JOIN hash
+Admins	Alice	admin
+Admins	Bob	user
+Everyone	Alice	admin
+Everyone	Bob	user
+Everyone	Charlie	moderator
+Everyone	David	admin
+Everyone	Eve	user
+Moderators	Alice	admin
+Moderators	Charlie	moderator
+Moderators	David	admin
+SingleUser	Eve	user
+Users	Bob	user
+Users	Charlie	moderator
+Test 2: INNER JOIN parallel_hash
+Admins	Alice	admin
+Admins	Bob	user
+Everyone	Alice	admin
+Everyone	Bob	user
+Everyone	Charlie	moderator
+Everyone	David	admin
+Everyone	Eve	user
+Moderators	Alice	admin
+Moderators	Charlie	moderator
+Moderators	David	admin
+SingleUser	Eve	user
+Users	Bob	user
+Users	Charlie	moderator
+Test 3: LEFT JOIN hash
+Admins	Alice
+Admins	Bob
+Empty	
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+NoMatch	
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 4: LEFT JOIN parallel_hash
+Admins	Alice
+Admins	Bob
+Empty	
+Everyone	Alice
+Everyone	Bob
+Everyone	Charlie
+Everyone	David
+Everyone	Eve
+Moderators	Alice
+Moderators	Charlie
+Moderators	David
+NoMatch	
+SingleUser	Eve
+Users	Bob
+Users	Charlie
+Test 5: RIGHT JOIN hash
+	Empty
+	NoMatch
+Alice	Admins
+Alice	Everyone
+Alice	Moderators
+Bob	Admins
+Bob	Everyone
+Bob	Users
+Charlie	Everyone
+Charlie	Moderators
+Charlie	Users
+David	Everyone
+David	Moderators
+Eve	Everyone
+Eve	SingleUser

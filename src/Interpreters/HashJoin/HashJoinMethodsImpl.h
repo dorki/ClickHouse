@@ -306,6 +306,8 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
             /// This avoids O(N) linear search through existing_rows for duplicates like [1,1,1,1]
             std::unordered_set<size_t> inserted_hashes_for_this_row;
 
+            std::cerr << "[BUILD] Processing row=" << ind << ", array_size=" << (array_end - array_start) << std::endl;
+
             /// For each element in the array, compute hash and insert
             for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
             {
@@ -361,6 +363,8 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                     {
                         new (&emplace_result.getMapped()) typename HashMap::mapped_type(stored_columns, ind);
                         inserted_hashes_for_this_row.insert(elem_hash);
+                        std::cerr << "[BUILD] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                  << ", NEW_KEY" << std::endl;
                     }
                     else
                     {
@@ -372,8 +376,14 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImplTypeCas
                             auto & existing_rows = emplace_result.getMapped();
                             existing_rows.insert({stored_columns, ind}, pool);
                             inserted_hashes_for_this_row.insert(elem_hash);
+                            std::cerr << "[BUILD] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                      << ", ADDED_TO_EXISTING" << std::endl;
                         }
-                        /// else: duplicate hash within same array [1,1,1,1] - skip
+                        else
+                        {
+                            std::cerr << "[BUILD] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                      << ", SKIPPED_DUPLICATE" << std::endl;
+                        }
                     }
                     /// Don't update all_values_unique here for array joins - we already set it to false
                     all_values_unique &= emplace_result.isInserted();
@@ -496,7 +506,7 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumnsSwitchMult
 
     if (selector.isContinuousRange())
     {
-        if (mapv.size() > 1 || added_columns.join_on_keys.empty())
+        if (mapv.size() > 1 || added_columns.join_on_keys.empty() || used_flags.isPerRowMode())
         {
             if (std::ranges::any_of(added_columns.join_on_keys, [](const auto & elem) { return elem.null_map; }))
                 joinRightColumnsSwitchJoinMaskKind<KeyGetter, Map, need_filter, /*check_null_map=*/true>(
@@ -518,7 +528,7 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumnsSwitchMult
     }
     else
     {
-        if (mapv.size() > 1 || added_columns.join_on_keys.empty())
+        if (mapv.size() > 1 || added_columns.join_on_keys.empty() || used_flags.isPerRowMode())
         {
             if (std::ranges::any_of(added_columns.join_on_keys, [](const auto & elem) { return elem.null_map; }))
                 joinRightColumnsSwitchJoinMaskKind<KeyGetter, Map, need_filter, /*check_null_map=*/true>(
@@ -593,6 +603,7 @@ void processMatch(
     {
         setUsed<need_filter>(added_columns.filter, i, added_columns.matched_rows);
         used_flags.template setUsed<join_features.need_flags, flag_per_row>(find_result);
+        std::cerr << "[PROCESS_MATCH] Marked hash entry as used, about to add all rows from RowRefList" << std::endl;
         auto used_flags_opt = join_features.need_flags ? &used_flags : nullptr;
         addFoundRowAll<Map, join_features.add_missing>(mapped, added_columns, current_offset, known_rows, used_flags_opt);
     }
@@ -647,8 +658,10 @@ template <
 void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
     KeyGetter & key_getter, const Map * map, AddedColumns & added_columns, JoinStuff::JoinUsedFlags & used_flags, const Selector & selector)
 {
-    static constexpr bool flag_per_row = false; // Always false in single map case
+    static constexpr bool flag_per_row = false;
     const auto & join_keys = added_columns.join_on_keys.at(0);
+
+    std::cerr << "[PROBE_INIT] flag_per_row=" << flag_per_row << ", rows=" << ScatteredBlock::Selector::size(selector) << std::endl;
 
     constexpr JoinFeatures<KIND, STRICTNESS, MapsTemplate> join_features;
 
@@ -692,6 +705,8 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
             else
                 row_acceptable = !join_keys.isRowFiltered(ind);
 
+            std::cerr << "[PROBE] Starting row i=" << i << ", ind=" << ind << std::endl;
+
             /// Check if any key column is an array - if so, we need array-aware probing
             /// Skip this for KeyGetterEmpty (used for EMPTY/CROSS joins with no keys)
             constexpr bool is_key_getter_empty = std::is_same_v<KeyGetter, KeyGetterEmpty<typename MapsTemplate::MappedType>>;
@@ -730,6 +745,12 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
 
                     /// Probe each array element using the existing key_getter
                     /// key_getter was created with element columns, so we use element indices
+
+                    /// Track which hashes we've already probed for this row to avoid duplicates like [500,500,500,500]
+                    std::unordered_set<size_t> probed_hashes_for_this_row;
+
+                    std::cerr << "[PROBE] Processing row=" << ind << ", array_size=" << (array_end - array_start) << std::endl;
+
                     for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
                     {
                         /// Skip NULL elements
@@ -738,14 +759,33 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
                             continue;
                         }
 
+                        /// Calculate hash to check for duplicates
+                        size_t elem_hash = key_getter.getHash(*map, elem_idx, pool);
+
+                        /// Skip if we've already probed this hash for this row
+                        if (probed_hashes_for_this_row.find(elem_hash) != probed_hashes_for_this_row.end())
+                        {
+                            std::cerr << "[PROBE] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                      << ", SKIPPED_DUPLICATE" << std::endl;
+                            continue;
+                        }
+                        probed_hashes_for_this_row.insert(elem_hash);
+
                         /// Use the existing key_getter which already has element columns
                         auto find_result = key_getter.findKey(*map, elem_idx, pool);
 
                         if (find_result.isFound())
                         {
+                            std::cerr << "[PROBE] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                      << ", FOUND_MATCH" << std::endl;
                             right_row_found = true;
                             processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
                                 find_result, added_columns, used_flags, i, ind, current_offset, dummy_known_rows);
+                        }
+                        else
+                        {
+                            std::cerr << "[PROBE] row=" << ind << ", elem_idx=" << elem_idx << ", hash=" << elem_hash
+                                      << ", NO_MATCH" << std::endl;
                         }
                     }
                 }
@@ -768,9 +808,14 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
 
         if (!right_row_found)
         {
+            std::cerr << "[PROBE] row=" << ind << ", RIGHT_ROW_NOT_FOUND, adding not found row" << std::endl;
             if constexpr (join_features.is_anti_join && join_features.left)
                 setUsed<need_filter>(added_columns.filter, i, added_columns.matched_rows);
             addNotFoundRow<join_features.add_missing, join_features.need_replication>(added_columns, current_offset);
+        }
+        else
+        {
+            std::cerr << "[PROBE] row=" << ind << ", RIGHT_ROW_FOUND" << std::endl;
         }
 
         if constexpr (join_features.need_replication)
@@ -821,6 +866,8 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
 {
     static constexpr bool flag_per_row = true; // Always true in multiple maps case
 
+    std::cerr << "[PROBE_INIT_MULTI] flag_per_row=" << flag_per_row << ", rows=" << ScatteredBlock::Selector::size(selector) << std::endl;
+
     constexpr JoinFeatures<KIND, STRICTNESS, MapsTemplate> join_features;
 
     size_t rows = ScatteredBlock::Selector::size(selector);
@@ -866,16 +913,82 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::joinRightColumns(
                     row_acceptable = !join_keys.isRowFiltered(ind);
 
                 using FindResult = typename KeyGetter::FindResult;
-                auto find_result = row_acceptable ? key_getter_vector[onexpr_idx].findKey(*(mapv[onexpr_idx]), ind, pool) : FindResult();
 
-                if (find_result.isFound())
+                /// Check for array keys and expand if needed
+                /// Skip for KeyGetterEmpty (CROSS joins) since they don't support getHash
+                constexpr bool is_key_getter_empty = std::is_same_v<KeyGetter, KeyGetterEmpty<typename MapsTemplate::MappedType>>;
+                ssize_t array_key_idx = -1;
+
+                if constexpr (!is_key_getter_empty)
                 {
-                    right_row_found = true;
-                    processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
-                        find_result, added_columns, used_flags, i, ind, current_offset, known_rows);
+                    if (!join_keys.key_columns.empty())
+                    {
+                        for (size_t key_idx = 0; key_idx < join_keys.key_columns.size(); ++key_idx)
+                        {
+                            if (typeid_cast<const ColumnArray *>(join_keys.key_columns[key_idx]))
+                            {
+                                array_key_idx = static_cast<ssize_t>(key_idx);
+                                break;
+                            }
+                        }
+                    }
+                }
 
-                    if constexpr ((join_features.is_any_join && join_features.inner) || (join_features.is_any_or_semi_join))
-                        break;
+                if constexpr (!is_key_getter_empty)
+                {
+                    if (array_key_idx >= 0 && row_acceptable)
+                    {
+                        /// Array expansion for this disjunct
+                        const auto * array_column = typeid_cast<const ColumnArray *>(join_keys.key_columns[array_key_idx]);
+                        const auto & offsets = array_column->getOffsets();
+                        size_t array_start = ind == 0 ? 0 : offsets[ind - 1];
+                        size_t array_end = offsets[ind];
+
+                        const IColumn & array_data = array_column->getData();
+                        const ColumnNullable * nullable_array_data = typeid_cast<const ColumnNullable *>(&array_data);
+                        const NullMap * element_null_map = nullable_array_data ? &nullable_array_data->getNullMapData() : nullptr;
+
+                        /// For deduplication: track hashes we've already probed
+                        std::unordered_set<size_t> probed_hashes;
+
+                        for (size_t elem_idx = array_start; elem_idx < array_end; ++elem_idx)
+                        {
+                            if (element_null_map && (*element_null_map)[elem_idx])
+                                continue;
+
+                            size_t hash = key_getter_vector[onexpr_idx].getHash(*(mapv[onexpr_idx]), elem_idx, pool);
+                            if (probed_hashes.find(hash) != probed_hashes.end())
+                                continue;
+                            probed_hashes.insert(hash);
+
+                            auto find_result = key_getter_vector[onexpr_idx].findKey(*(mapv[onexpr_idx]), elem_idx, pool);
+                            if (find_result.isFound())
+                            {
+                                right_row_found = true;
+                                processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                                    find_result, added_columns, used_flags, i, ind, current_offset, known_rows);
+
+                                if constexpr ((join_features.is_any_join && join_features.inner) || (join_features.is_any_or_semi_join))
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+                if (array_key_idx < 0 || !row_acceptable)
+                {
+                    /// Scalar key - normal processing (no array expansion needed)
+                    auto find_result = row_acceptable ? key_getter_vector[onexpr_idx].findKey(*(mapv[onexpr_idx]), ind, pool) : FindResult();
+
+                    if (find_result.isFound())
+                    {
+                        right_row_found = true;
+                        processMatch<KIND, STRICTNESS, need_filter, flag_per_row, MapsTemplate, Map, KeyGetter>(
+                            find_result, added_columns, used_flags, i, ind, current_offset, known_rows);
+
+                        if constexpr ((join_features.is_any_join && join_features.inner) || (join_features.is_any_or_semi_join))
+                            break;
+                    }
                 }
             }
         }

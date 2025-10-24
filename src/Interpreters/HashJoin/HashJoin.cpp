@@ -1679,6 +1679,16 @@ bool HashJoin::needUsedFlagsForPerRightTableRow(std::shared_ptr<TableJoin> table
     /// If it'a a all right join with inequal conditions, we need to mark each row
     if (table_join_->getMixedJoinExpression() && isRightOrFull(table_join_->kind()))
         return true;
+    /// For RIGHT/FULL joins with array keys, use row-based tracking because each array element creates
+    /// a separate hash entry, and we need to track at the original row level to avoid duplicates/missing rows
+    if (isRightOrFull(table_join_->kind()))
+    {
+        for (const auto & clause : table_join_->getClauses())
+        {
+            if (clause.hasArrayJoinKeys())
+                return true;
+        }
+    }
     return false;
 }
 
